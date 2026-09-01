@@ -149,7 +149,18 @@ async def tts(req: BrainRequest):
 # ---------- health ----------
 @app.get("/health")
 async def health():
-    return {"ok": True, "stt": bool(GROQ_KEY), "brain": bool(BRAIN_KEY), "tts": bool(TTS_VOICE)}
+    probe = None
+    brain_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            rr = await c.get(f"http://{BRAIN_HOST}:{BRAIN_PORT}/v1/models",
+                             headers={"Authorization": f"Bearer {BRAIN_KEY}"})
+            brain_ok = rr.status_code == 200
+            probe = {"host": BRAIN_HOST, "port": BRAIN_PORT, "code": rr.status_code}
+    except Exception as e:
+        probe = {"host": BRAIN_HOST, "port": BRAIN_PORT, "err": str(e)[:120]}
+    return {"ok": True, "stt": bool(GROQ_KEY), "brain": brain_ok,
+            "tts": bool(TTS_VOICE), "brain_url": BRAIN_URL, "probe": probe}
 
 
 # ---------- static ----------
