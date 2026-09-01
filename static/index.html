@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Hermes Voice</title>
+<style>
+:root {
+  --bg: #0a0b10;
+  --bg2: #10121c;
+  --card: #151824;
+  --ink: #e8ecf6;
+  --ink-dim: #8b93a8;
+  --accent: #6c7bff;
+  --accent2: #9a7bff;
+  --green: #4fe08a;
+  --red: #ff6b6b;
+  --radius: 18px;
+  --shadow: 0 10px 40px rgba(0,0,0,.5);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: radial-gradient(1200px 800px at 20% -10%, #1a1c3a 0%, var(--bg) 55%);
+  color: var(--ink);
+  display: flex; flex-direction: column; align-items: center;
+  min-height: 100vh; overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+header {
+  width: 100%; max-width: 640px;
+  padding: 22px 22px 8px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.logo { display: flex; align-items: center; gap: 10px; }
+.logo .orb {
+  width: 34px; height: 34px; border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, var(--accent), var(--accent2));
+  box-shadow: 0 0 22px var(--accent); animation: pulse 3s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100%{transform:scale(1);opacity:.9} 50%{transform:scale(1.08);opacity:1} }
+.logo h1 { font-size: 19px; font-weight: 600; letter-spacing: .2px; }
+.logo .sub { font-size: 11px; color: var(--ink-dim); }
+.status {
+  font-size: 12px; padding: 6px 12px; border-radius: 20px;
+  background: rgba(255,255,255,.05); color: var(--ink-dim);
+  border: 1px solid rgba(255,255,255,.07);
+}
+.status.on { color: var(--green); border-color: rgba(79,224,138,.4); }
+.status.err { color: var(--red); border-color: rgba(255,107,107,.4); }
+
+main { width: 100%; max-width: 640px; padding: 10px 22px 24px; flex: 1; display:flex; flex-direction:column; }
+.stage {
+  flex: 1; background: var(--card); border-radius: var(--radius);
+  padding: 26px 24px; box-shadow: var(--shadow);
+  border: 1px solid rgba(255,255,255,.06);
+  display: flex; flex-direction: column; gap: 22px; min-height: 320px;
+}
+.conv { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:14px; max-height: 42vh; }
+.bubble { max-width: 82%; padding: 12px 16px; border-radius: 16px; font-size: 15px; line-height:1.5; opacity:0; transform: translateY(6px); animation: in .25s forwards; }
+@keyframes in { to{opacity:1; transform:none} }
+.bubble.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent2)); color:#fff; border-bottom-right-radius:5px; }
+.bubble.ai { align-self: flex-start; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.07); border-bottom-left-radius:5px; }
+.bubble .who { font-size:10px; text-transform: uppercase; letter-spacing:.7px; color: var(--ink-dim); margin-bottom:3px; }
+.bubble.ai .who { color:#b9b3ff; }
+.mic-capture { margin-top: 12px; }
+.tape {
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  padding: 18px 14px 8px;
+}
+.pulse-ring { position: relative; width: 96px; height: 96px; flex-shrink:0; }
+.pulse-ring .ring {
+  position:absolute; inset:0; border-radius:50%;
+  border: 2px solid var(--accent); opacity:.25;
+  transition: transform .5s, opacity .5s;
+}
+.mic-btn {
+  position: absolute; inset: 12px; border-radius: 50%;
+  border: none; cursor: pointer;
+  background: linear-gradient(145deg, #23283a, #151824);
+  box-shadow: 0 8px 24px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.06);
+  display:flex; align-items:center; justify-content:center;
+  transition: transform .15s, box-shadow .2s, background .2s;
+}
+.mic-btn svg { width: 30px; height: 30px; fill: var(--ink-dim); transition: fill .2s; }
+.mic-btn:hover { transform: scale(1.04); }
+.mic-btn:active { transform: scale(.96); }
+.mic-btn.rec {
+  background: linear-gradient(145deg, var(--accent), var(--accent2));
+  box-shadow: 0 8px 30px rgba(108,123,255,.55);
+}
+.mic-btn.rec svg { fill:#fff; }
+.mic-btn.rec ~ .ring { animation: ripple 1.2s infinite; border-color: var(--accent2); opacity:.5; }
+@keyframes ripple { 0%{transform:scale(1);opacity:.5} 100%{transform:scale(1.5);opacity:0} }
+.tape .hint { font-size: 12px; color: var(--ink-dim); }
+.tape .hint strong { color: var(--ink); }
+.waveform { height: 44px; display:flex; align-items:center; justify-content:center; gap: 2px; min-height:44px; }
+.waveform span { width: 3px; border-radius:2px; background: var(--accent); height: 4px; transition: height .08s; }
+.listening-line { font-size: 12px; color: var(--green); min-height: 16px; text-align:center; }
+.controls { display:flex; gap:10px; justify-content:center; margin-top:10px; flex-wrap:wrap; }
+.voice-pick, .action {
+  background: rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1);
+  color: var(--ink); padding: 7px 14px; border-radius: 12px; font-size: 13px; cursor:pointer;
+}
+.voice-pick:hover, .action:hover { background: rgba(255,255,255,.1); }
+footer { padding: 14px; font-size: 11px; color: var(--ink-dim); text-align:center; }
+.msg { font-size: 12px; text-align:center; margin-top: 8px; min-height: 16px; }
+.msg.err { color: var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">
+    <div class="orb"></div>
+    <div>
+      <h1>Hermes Voice</h1>
+      <div class="sub">speak · think · reply</div>
+    </div>
+  </div>
+  <div class="status" id="status">…</div>
+</header>
+
+<main>
+  <div class="stage">
+    <div class="conv" id="conv"></div>
+
+    <div class="mic-capture">
+      <div class="waveform" id="wf"></div>
+      <div class="listening-line" id="listen"></div>
+      <div class="tape">
+        <div class="pulse-ring">
+          <div class="ring"></div>
+          <button class="mic-btn" id="micBtn" aria-label="Hold to talk">
+            <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V21H8a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2h-3v-3.08A7 7 0 0 0 19 11z"/></svg>
+          </button>
+        </div>
+        <div class="hint"><strong>Hold</strong> the mic, or <strong>type</strong> below</div>
+      </div>
+      <div class="controls">
+        <select id="voice" class="voice-pick" title="Voice"></select>
+        <button class="action" id="autoSpeak">🔊 Auto-speak: On</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="msg" id="msg"></div>
+  <textarea id="typeInput" placeholder="Type a message… (Enter to send)" style="display:none"></textarea>
+</main>
+
+<footer>Powered by Hermes agent · Groq STT · edge-tts</footer>
+
+<script>
+const API = location.origin;
+const conv = document.getElementById('conv');
+const msgEl = document.getElementById('msg');
+const statusEl = document.getElementById('status');
+const micBtn = document.getElementById('micBtn');
+const wf = document.getElementById('wf');
+const listenEl = document.getElementById('listen');
+const voicePick = document.getElementById('voice');
+const autoSpeakBtn = document.getElementById('autoSpeak');
+const typeInput = document.getElementById('typeInput');
+
+let autoSpeak = true;
+let recording = false, recTimeout = null;
+let mediaRec = null, chunks = [], stream = null;
+let isBusy = false;
+let lastSession = null;
+
+const VOICES = ['en-US-AriaNeural','en-US-JennyNeural','en-US-GuyNeural','en-GB-RyanNeural','en-GB-SoniaNeural','en-IN-NeerjaNeural','en-IN-PrabhatNeural','hi-IN-SwaraNeural'];
+
+function addBubble(text, who) {
+  const b = document.createElement('div');
+  b.className = 'bubble ' + who;
+  b.innerHTML = `<div class="who">${who==='user'?'You':'Hermes'}</div><div>${text}</div>`;
+  conv.appendChild(b);
+  b.scrollIntoView({behavior:'smooth', block:'end'});
+  return b;
+}
+function setStatus(t, cls) { statusEl.textContent = t; statusEl.className = 'status' + (cls?' '+cls:''); }
+function setMsg(t, cls) { msgEl.textContent = t; msgEl.className = 'msg' + (cls?' '+cls:''); }
+
+// waveform
+for (let i=0;i<28;i++){ const s=document.createElement('span'); wf.appendChild(s); }
+const wfBars = wf.children;
+function drawWave(levels) {
+  for (let i=0;i<wfBars.length;i++){
+    const v = levels && levels[i] ? Math.min(1, levels[i]) : 0.05;
+    wfBars[i].style.height = (4 + v*40) + 'px';
+  }
+}
+
+// voices
+VOICES.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; voicePick.appendChild(o); });
+voicePick.value = 'en-US-AriaNeural';
+
+// status + mic
+async function initMic() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+    setStatus('Mic ready', 'on');
+    micBtn.disabled = false;
+  } catch(e) {
+    setStatus('Mic blocked — type instead', 'err');
+    setMsg('Allow microphone access to talk. You can still type below.', 'err');
+    typeInput.style.display = 'block';
+  }
+}
+
+micBtn.addEventListener('mousedown', startRec);
+micBtn.addEventListener('touchstart', e=>{e.preventDefault(); startRec();}, {passive:false});
+function endRec(){ if (recording) stopRec(); }
+micBtn.addEventListener('mouseup', endRec);
+micBtn.addEventListener('mouseleave', endRec);
+micBtn.addEventListener('touchend', e=>{e.preventDefault(); endRec();}, {passive:false});
+
+async function startRec() {
+  if (isBusy) return;
+  if (!stream) return;
+  chunks = [];
+  mediaRec = new MediaRecorder(stream);
+  mediaRec.ondataavailable = e => { if (e.data.size>0) chunks.push(e.data); };
+  mediaRec.onstop = onRecStop;
+  mediaRec.start();
+  recording = true;
+  micBtn.classList.add('rec');
+  listenEl.textContent = 'Listening…';
+  // reset after 12s
+  recTimeout = setTimeout(()=>{ if (recording) stopRec(); }, 12000);
+  // live waveform via analyser
+  const ctx = new AudioContext();
+  const src = ctx.createMediaStreamSource(stream);
+  const ana = ctx.createAnalyser(); ana.fftSize = 256;
+  src.connect(ana);
+  const data = new Uint8Array(ana.frequencyBinCount);
+  (function loop(){
+    if (!recording) { ctx.close(); return; }
+    ana.getByteFrequencyData(data);
+    const levels = [];
+    for (let i=0;i<wfBars.length;i++){
+      const idx = Math.floor(i/wfBars.length * data.length);
+      levels.push(data[idx]/255);
+    }
+    drawWave(levels);
+    requestAnimationFrame(loop);
+  })();
+}
+
+function stopRec(){
+  if (!recording) return;
+  recording = false;
+  clearTimeout(recTimeout);
+  mediaRec.stop();
+  micBtn.classList.remove('rec');
+  listenEl.textContent = '';
+  drawWave(null);
+}
+
+async function onRecStop() {
+  const blob = new Blob(chunks, {type: mediaRec.mimeType || 'audio/webm'});
+  if (blob.size < 1000) { setMsg('Too short — hold a moment after you speak.'); return; }
+  await processAudio(blob);
+}
+
+async function processAudio(blob) {
+  isBusy = true;
+  setStatus('Transcribing…');
+  try {
+    const fd = new FormData();
+    fd.append('file', blob, 'audio.webm');
+    const s = await fetch(API + '/stt', {method:'POST', body:fd});
+    if (!s.ok) throw new Error('STT ' + s.status);
+    const sj = await s.json();
+    const text = sj.text.trim();
+    if (!text) { setMsg('Didn’t catch that — try again.'); isBusy=false; setStatus('Mic ready','on'); return; }
+    addBubble(text, 'user');
+    await doBrain(text);
+  } catch(e) {
+    setMsg('Error: ' + e.message, 'err');
+    setStatus('Mic ready', 'on');
+    isBusy = false;
+  }
+}
+
+async function doBrain(text) {
+  setStatus('Thinking…');
+  try {
+    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+    if (!r.ok) throw new Error('Brain ' + r.status);
+    const rj = await r.json();
+    const reply = (rj.reply || '').trim();
+    addBubble(reply, 'ai');
+    if (autoSpeak) await speak(reply);
+  } catch(e) {
+    setMsg('Error: ' + e.message, 'err');
+  }
+  isBusy = false;
+  setStatus('Mic ready', 'on');
+}
+
+async function speak(text) {
+  setStatus('Speaking…');
+  try {
+    const r = await fetch(API + '/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: lastSession})});
+    if (!r.ok) throw new Error('TTS ' + r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onended = () => { URL.revokeObjectURL(url); if (!recording) setStatus('Mic ready','on'); };
+    await audio.play();
+  } catch(e) {
+    setMsg('TTS error: ' + e.message, 'err');
+    setStatus('Mic ready', 'on');
+  }
+}
+
+autoSpeakBtn.addEventListener('click', ()=>{ autoSpeak=!autoSpeak; autoSpeakBtn.textContent = '🔊 Auto-speak: ' + (autoSpeak?'On':'Off'); });
+voicePick.addEventListener('change', ()=>{ /* toggle server uses default; could pass voice via /tts */ });
+
+// keyboard: space to talk while focus elsewhere
+document.addEventListener('keydown', async e=>{
+  if (e.code==='Space' && document.activeElement!==typeInput && !e.repeat && !isBusy) { e.preventDefault(); if (!stream) await initMic(); startRec(); }
+});
+document.addEventListener('keyup', e=>{ if (e.code==='Space') endRec(); });
+
+// text fallback
+typeInput.addEventListener('keydown', async e=>{
+  if (e.key==='Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const t = typeInput.value.trim();
+    if (!t) return;
+    typeInput.value='';
+    addBubble(t,'user');
+    setStatus('Thinking…');
+    isBusy = true;
+    try {
+      const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})});
+      if (!r.ok) throw new Error('Brain '+r.status);
+      const rj = await r.json();
+      addBubble((rj.reply||'').trim(),'ai');
+      if (autoSpeak) await speak(rj.reply.trim());
+    } catch(err){ setMsg('Error: '+err.message,'err'); }
+    isBusy=false; setStatus('Mic ready','on');
+  }
+});
+
+// health + init
+async function boot(){
+  try {
+    const r = await fetch(API + '/health');
+    if (!r.ok) throw new Error('health ' + r.status);
+    const j = await r.json();
+    setStatus('Connected', 'on');
+  } catch(e){ setStatus('Offline', 'err'); }
+  await initMic();
+}
+boot();
+</script>
+</body>
+</html>
