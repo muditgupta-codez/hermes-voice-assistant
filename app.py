@@ -35,8 +35,16 @@ BRAIN_MODEL = os.environ.get("BRAIN_MODEL", "hermes-agent")
 # Order: explicit env host first (if set to something other than default), then
 # known compose/container aliases. The first that yields a 200 from /v1/models wins.
 BRAIN_HOST_CANDIDATES = [
-    h for h in [BRAIN_HOST, "hermes-agent", "hermes-webui",
-                "host.docker.internal", "172.18.0.1", "172.17.0.1"]
+    h for h in [BRAIN_HOST,
+                "hermes-agent",
+                "hermes-webui",
+                "hermes-agent-kl7hbed36wlg9vcxudhm8jco",
+                "host.docker.internal",
+                "172.18.0.1",
+                "172.17.0.1",
+                "127.0.0.1",
+                "169.58.74.130",
+                "10.0.3.1"]
     if h
 ]
 
