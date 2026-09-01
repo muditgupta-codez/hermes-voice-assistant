@@ -49,7 +49,7 @@ BRAIN_HOST_CANDIDATES = [
 ]
 
 
-async def _probe_brain(host: str, port: str, key: str, timeout: float = 4.0) -> bool:
+async def _probe_brain(host: str, port: str, key: str, timeout: float = 2.0) -> bool:
     """Return True if the brain api_server answers with 200 at host:port."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as c:
