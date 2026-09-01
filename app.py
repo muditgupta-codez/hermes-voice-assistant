@@ -31,6 +31,39 @@ BRAIN_PORT = os.environ.get("API_SERVER_PORT", "8642")
 BRAIN_URL = f"http://{BRAIN_HOST}:{BRAIN_PORT}/v1/chat/completions"
 BRAIN_MODEL = os.environ.get("BRAIN_MODEL", "hermes-agent")
 
+# Candidate hosts to try when reaching the brain on the docker 'coolify' network.
+# Order: explicit env host first (if set to something other than default), then
+# known compose/container aliases. The first that yields a 200 from /v1/models wins.
+BRAIN_HOST_CANDIDATES = [
+    h for h in [BRAIN_HOST, "hermes-agent", "hermes-webui",
+                "host.docker.internal", "172.18.0.1", "172.17.0.1"]
+    if h
+]
+
+
+async def _probe_brain(host: str, port: str, key: str, timeout: float = 4.0) -> bool:
+    """Return True if the brain api_server answers with 200 at host:port."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(f"http://{host}:{port}/v1/models",
+                            headers={"Authorization": f"Bearer {key}"})
+            return r.status_code in (200, 401, 403)  # auth reachable = live
+    except Exception:
+        return False
+
+
+async def find_brain_host() -> tuple[str, str, int]:
+    """Try each candidate in order; return the first working (host, port, index).
+
+    Candidate order: configured BRAIN_HOST first (usually a compose/container
+    name), then known aliases on the 'coolify' network. The first to answer on
+    /v1/models wins; if none do, fall back to the configured host.
+    """
+    for i, h in enumerate(BRAIN_HOST_CANDIDATES):
+        if await _probe_brain(h, BRAIN_PORT, BRAIN_KEY):
+            return h, BRAIN_PORT, i
+    return BRAIN_HOST, BRAIN_PORT, -1
+
 TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-AriaNeural")
 
 # System prompt / persona for the assistant.
@@ -109,8 +142,11 @@ async def brain(req: BrainRequest):
         "temperature": 0.6,
     }
     async with httpx.AsyncClient(timeout=90) as client:
+        # Discover the brain's reachable hostname, then make the request.
+        host, port, _idx = await find_brain_host()
+        url = f"http://{host}:{port}/v1/chat/completions"
         r = await client.post(
-            BRAIN_URL,
+            url,
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {BRAIN_KEY}"},
             json=payload,
@@ -152,11 +188,12 @@ async def health():
     probe = None
     brain_ok = False
     try:
+        host, port, idx = await find_brain_host()
         async with httpx.AsyncClient(timeout=5) as c:
-            rr = await c.get(f"http://{BRAIN_HOST}:{BRAIN_PORT}/v1/models",
+            rr = await c.get(f"http://{host}:{port}/v1/models",
                              headers={"Authorization": f"Bearer {BRAIN_KEY}"})
             brain_ok = rr.status_code == 200
-            probe = {"host": BRAIN_HOST, "port": BRAIN_PORT, "code": rr.status_code}
+        probe = {"host": host, "port": port, "code": rr.status_code, "idx": idx}
     except Exception as e:
         probe = {"host": BRAIN_HOST, "port": BRAIN_PORT, "err": str(e)[:120]}
     return {"ok": True, "stt": bool(GROQ_KEY), "brain": brain_ok,
