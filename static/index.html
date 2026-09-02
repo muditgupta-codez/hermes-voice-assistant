@@ -166,6 +166,8 @@ let autoSpeak = true;
 let recording = false, recTimeout = null;
 let mediaRec = null, chunks = [], stream = null;
 let isBusy = false;
+let starting = false;
+let pressed = false;
 let lastSession = null;
 
 // --- audio playback (persistent element + autoplay unlock) ---
@@ -241,9 +243,9 @@ async function initMic() {
   }
 }
 
-micBtn.addEventListener('mousedown', startRec);
-micBtn.addEventListener('touchstart', e=>{e.preventDefault(); unlockAudio(); startRec();}, {passive:false});
-function endRec(){ if (recording) stopRec(); }
+micBtn.addEventListener('mousedown', ()=>{ pressed=true; startRec(); });
+micBtn.addEventListener('touchstart', e=>{e.preventDefault(); pressed=true; unlockAudio(); startRec();}, {passive:false});
+function endRec(){ pressed=false; if (recording) stopRec(); }
 micBtn.addEventListener('mouseup', endRec);
 micBtn.addEventListener('mouseleave', endRec);
 micBtn.addEventListener('touchend', e=>{e.preventDefault(); endRec();}, {passive:false});
@@ -251,7 +253,18 @@ micBtn.addEventListener('mousedown', unlockAudio);
 
 async function startRec() {
   if (isBusy) return;
-  if (!stream) return;
+  if (starting || recording) return;
+  // iOS Safari drops the mic track after the first MediaRecorder session.
+  // Re-acquire a fresh stream when the current one is no longer live.
+  if (!stream || !stream.getAudioTracks().find(t=>t.readyState==='live')) {
+    starting = true;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+      if (!pressed) { starting = false; return; }  // released during await — don't start
+    }
+    catch(e){ starting = false; setMsg('Mic unavailable — type instead', 'err'); return; }
+    starting = false;
+  }
   chunks = [];
   // Pick the browser's native recording mime (iOS Safari = audio/mp4, not webm)
   const preferred = ['audio/webm,codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
@@ -290,15 +303,17 @@ function stopRec(){
   if (!recording) return;
   recording = false;
   clearTimeout(recTimeout);
-  mediaRec.stop();
+  try { mediaRec.stop(); } catch(e){}
   micBtn.classList.remove('rec');
   listenEl.textContent = '';
   drawWave(null);
+  // Release the mic track so iOS doesn't hold a stale stream for the next tap.
+  if (stream) stream.getAudioTracks().forEach(t=>{ try{ t.stop(); }catch(e){} });
 }
 
 async function onRecStop() {
   const blob = new Blob(chunks, {type: mediaRec.mimeType || 'audio/webm'});
-  if (blob.size < 1000) { setMsg('Too short — hold a moment after you speak.'); return; }
+  if (blob.size < 1000) { setMsg('Too short — hold a moment after you speak.'); isBusy=false; setStatus('Mic ready','on'); return; }
   await processAudio(blob);
 }
 
@@ -366,9 +381,9 @@ voicePick.addEventListener('change', ()=>{ /* toggle server uses default; could 
 
 // keyboard: space to talk while focus elsewhere
 document.addEventListener('keydown', async e=>{
-  if (e.code==='Space' && document.activeElement!==typeInput && !e.repeat && !isBusy) { e.preventDefault(); if (!stream) await initMic(); startRec(); }
+  if (e.code==='Space' && document.activeElement!==typeInput && !e.repeat && !isBusy) { e.preventDefault(); pressed=true; if (!stream) await initMic(); startRec(); }
 });
-document.addEventListener('keyup', e=>{ if (e.code==='Space') endRec(); });
+document.addEventListener('keyup', e=>{ if (e.code==='Space') { pressed=false; endRec(); } });
 
 // text fallback
 typeInput.addEventListener('keydown', async e=>{
