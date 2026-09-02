@@ -179,6 +179,20 @@ function addBubble(text, who) {
   return b;
 }
 function setStatus(t, cls) { statusEl.textContent = t; statusEl.className = 'status' + (cls?' '+cls:''); }
+function setThinking() {
+  statusEl.textContent = 'Thinking';
+  statusEl.className = 'status on';
+  // animate dots so the wait reads as active processing, not a freeze
+  let n = 0;
+  if (statusEl._think) clearInterval(statusEl._think);
+  statusEl._think = setInterval(()=>{
+    n = (n+1) % 4;
+    statusEl.textContent = 'Thinking' + '.'.repeat(n);
+  }, 450);
+}
+function clearThinking() {
+  if (statusEl._think) { clearInterval(statusEl._think); statusEl._think = null; }
+}
 function setMsg(t, cls) { msgEl.textContent = t; msgEl.className = 'msg' + (cls?' '+cls:''); }
 
 // waveform
@@ -284,7 +298,7 @@ async function processAudio(blob) {
 }
 
 async function doBrain(text) {
-  setStatus('Thinking…');
+  setThinking();
   try {
     const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
     if (!r.ok) throw new Error('Brain ' + r.status);
@@ -295,6 +309,7 @@ async function doBrain(text) {
   } catch(e) {
     setMsg('Error: ' + e.message, 'err');
   }
+  clearThinking();
   isBusy = false;
   setStatus('Mic ready', 'on');
 }
@@ -332,7 +347,7 @@ typeInput.addEventListener('keydown', async e=>{
     if (!t) return;
     typeInput.value='';
     addBubble(t,'user');
-    setStatus('Thinking…');
+    setThinking();
     isBusy = true;
     try {
       const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})});
@@ -341,6 +356,7 @@ typeInput.addEventListener('keydown', async e=>{
       addBubble((rj.reply||'').trim(),'ai');
       if (autoSpeak) await speak(rj.reply.trim());
     } catch(err){ setMsg('Error: '+err.message,'err'); }
+    clearThinking();
     isBusy=false; setStatus('Mic ready','on');
   }
 });
