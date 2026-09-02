@@ -142,6 +142,13 @@ async def stt(file: UploadFile = File(...)):
 
 
 # ---------- BRAIN ----------
+# Uses the NATIVE Hermes agent session endpoint (/v1/runs), NOT the stateless
+# /v1/chat/completions. This gives real conversation memory (same session_id
+# loads prior turns) plus the full Hermes persona/tools — "Hermes native".
+def _runs_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}/v1/runs"
+
+
 @app.post("/brain")
 async def brain(req: BrainRequest):
     if not BRAIN_KEY:
@@ -149,32 +156,59 @@ async def brain(req: BrainRequest):
     text = req.text.strip()
     if not text:
         raise HTTPException(400, "empty text")
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": text},
-    ]
+
+    # session_id (client-generated, persisted in localStorage) provides memory.
+    # Omitting it starts a fresh agent session each turn — that's the old bug.
+    session_id = (req.session_id or "").strip() or None
+
     payload = {
+        "input": text,
         "model": BRAIN_MODEL,
-        "messages": messages,
-        "max_tokens": 300,
-        "temperature": 0.6,
+        # instructions guide tone/concision without replacing the native persona.
+        "instructions": SYSTEM_PROMPT,
     }
-    async with httpx.AsyncClient(timeout=90) as client:
-        # Discover the brain's reachable hostname, then make the request.
+    if session_id:
+        payload["session_id"] = session_id
+
+    async with httpx.AsyncClient(timeout=120) as client:
         host, port, _idx = await find_brain_host()
-        url = f"http://{host}:{port}/v1/chat/completions"
+        url = _runs_url(host, port)
+
+        # Start the run (returns run_id immediately).
         r = await client.post(
             url,
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {BRAIN_KEY}"},
             json=payload,
         )
-    if r.status_code != 200:
-        log.error("brain failed %s: %s", r.status_code, r.text[:300])
-        raise HTTPException(502, f"Brain failed: {r.status_code}")
-    reply = r.json()["choices"][0]["message"]["content"].strip()
-    log.info("BRIAN -> %r", reply)
-    return {"reply": reply}
+        if r.status_code != 200 and r.status_code != 202:
+            log.error("brain start failed %s: %s", r.status_code, r.text[:300])
+            raise HTTPException(502, f"Brain start failed: {r.status_code}")
+        run_id = r.json().get("run_id")
+
+        # Poll GET /v1/runs/{run_id} until the run settles.
+        status_url = url + "/" + run_id
+        for _ in range(60):
+            await asyncio.sleep(2)
+            pr = await client.get(status_url, headers={"Authorization": f"Bearer {BRAIN_KEY}"})
+            if pr.status_code == 404:
+                # transient: run not yet registered under a fresh host; retry
+                continue
+            if pr.status_code != 200:
+                continue
+            st = pr.json()
+            status = st.get("status")
+            if status in ("completed", "failed", "interrupted", "cancelled"):
+                if status != "completed":
+                    raise HTTPException(502, f"Brain run {status}: {st.get('error','')}")
+                reply = (st.get("output") or "").strip()
+                if not reply:
+                    raise HTTPException(502, "Brain returned empty reply")
+                log.info("BRAIN -> %r", reply)
+                return {"reply": reply, "run_id": run_id, "session_id": session_id}
+            if status == "queued" or status == "running":
+                continue
+        raise HTTPException(504, "Brain run timed out")
 
 
 # ---------- TTS ----------

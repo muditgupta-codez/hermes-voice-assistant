@@ -168,7 +168,7 @@ let mediaRec = null, chunks = [], stream = null;
 let isBusy = false;
 let starting = false;
 let pressed = false;
-let lastSession = null;
+let lastSession = (()=>{ let s = localStorage.getItem('hsess'); if (!s) { s = 'v_'+crypto.randomUUID(); localStorage.setItem('hsess', s); } return s; })();
 
 // --- audio playback (persistent element + autoplay unlock) ---
 // The TTS reply takes ~3-4s to generate, so by the time we call play() the
@@ -369,7 +369,7 @@ async function doBrain(text) {
   setThinking();
   currentAbort = new AbortController();
   try {
-    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text}), signal: currentAbort.signal});
+    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: lastSession}), signal: currentAbort.signal});
     if (!r.ok) throw new Error('Brain ' + r.status);
     const rj = await r.json();
     const reply = (rj.reply || '').trim();
@@ -423,7 +423,7 @@ typeInput.addEventListener('keydown', async e=>{
     setThinking();
     isBusy = true;
     try {
-      const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})});
+      const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t, session_id: lastSession})});
       if (!r.ok) throw new Error('Brain '+r.status);
       const rj = await r.json();
       addBubble((rj.reply||'').trim(),'ai');
