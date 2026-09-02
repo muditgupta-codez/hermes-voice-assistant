@@ -60,15 +60,25 @@ async def _probe_brain(host: str, port: str, key: str, timeout: float = 2.0) -> 
         return False
 
 
+_brain_host_cache: dict = {}
+
+
 async def find_brain_host() -> tuple[str, str, int]:
     """Try each candidate in order; return the first working (host, port, index).
 
     Candidate order: configured BRAIN_HOST first (usually a compose/container
     name), then known aliases on the 'coolify' network. The first to answer on
     /v1/models wins; if none do, fall back to the configured host.
+
+    The discovered host is cached after the first success, so subsequent calls
+    skip the probe walk entirely (the walk costs ~2s per dead candidate and was
+    the cause of multi-second 'thinking' stalls once the port is published).
     """
+    if _brain_host_cache.get("host"):
+        return _brain_host_cache["host"], _brain_host_cache["port"], _brain_host_cache["idx"]
     for i, h in enumerate(BRAIN_HOST_CANDIDATES):
         if await _probe_brain(h, BRAIN_PORT, BRAIN_KEY):
+            _brain_host_cache.update(host=h, port=BRAIN_PORT, idx=i)
             return h, BRAIN_PORT, i
     return BRAIN_HOST, BRAIN_PORT, -1
 
