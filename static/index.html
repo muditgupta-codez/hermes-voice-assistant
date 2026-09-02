@@ -168,6 +168,25 @@ let mediaRec = null, chunks = [], stream = null;
 let isBusy = false;
 let lastSession = null;
 
+// --- audio playback (persistent element + autoplay unlock) ---
+// The TTS reply takes ~3-4s to generate, so by the time we call play() the
+// original mic-press "user gesture" has expired and the browser blocks it with
+// NotAllowedError ("not allowed by the user agent ... user denied permission").
+// Fix: unlock autoplay once on the first user gesture with a silent play, then
+// reuse a single Audio element for all replies (autoplay stays granted).
+const audioEl = new Audio();
+const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YQAAAAA=";
+let audioUnlocked = false;
+function unlockAudio() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  audioEl.src = SILENT_WAV;
+  audioEl.play().then(() => { audioEl.pause(); audioEl.currentTime = 0; }).catch(() => {});
+}
+document.addEventListener('pointerdown', unlockAudio);
+document.addEventListener('touchstart', unlockAudio, {passive:true});
+document.addEventListener('keydown', unlockAudio);
+
 const VOICES = ['en-US-AriaNeural','en-US-JennyNeural','en-US-GuyNeural','en-GB-RyanNeural','en-GB-SoniaNeural','en-IN-NeerjaNeural','en-IN-PrabhatNeural','hi-IN-SwaraNeural'];
 
 function addBubble(text, who) {
@@ -321,9 +340,10 @@ async function speak(text) {
     if (!r.ok) throw new Error('TTS ' + r.status);
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
-    const audio = new Audio(url);
-    audio.onended = () => { URL.revokeObjectURL(url); if (!recording) setStatus('Mic ready','on'); };
-    await audio.play();
+    // reuse the persistent element (autoplay already unlocked)
+    audioEl.src = url;
+    audioEl.onended = () => { URL.revokeObjectURL(url); if (!recording) setStatus('Mic ready','on'); };
+    await audioEl.play();
   } catch(e) {
     setMsg('TTS error: ' + e.message, 'err');
     setStatus('Mic ready', 'on');
