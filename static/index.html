@@ -189,6 +189,29 @@ document.addEventListener('pointerdown', unlockAudio);
 document.addEventListener('touchstart', unlockAudio, {passive:true});
 document.addEventListener('keydown', unlockAudio);
 
+// --- barge-in interrupt ---
+// Pressing the mic while TTS is speaking must cut the audio and abort any
+// in-flight brain/TTS request so the user can talk over the assistant.
+let currentAbort = null;
+let speaking = false;
+
+function stopSpeaking() {
+  speaking = false;
+  try { audioEl.pause(); audioEl.currentTime = 0; } catch(e){}
+  // revoke any pending object URL on the element
+  const src = audioEl.src;
+  if (src && src.startsWith('blob:')) { try { URL.revokeObjectURL(src); } catch(e){} }
+  audioEl.src = SILENT_WAV;
+  if (!recording) setStatus('Mic ready', 'on');
+}
+
+function interrupt() {
+  if (currentAbort) { try { currentAbort.abort(); } catch(e){} currentAbort = null; }
+  stopSpeaking();
+  clearThinking();
+  isBusy = false;
+}
+
 const VOICES = ['en-US-AriaNeural','en-US-JennyNeural','en-US-GuyNeural','en-GB-RyanNeural','en-GB-SoniaNeural','en-IN-NeerjaNeural','en-IN-PrabhatNeural','hi-IN-SwaraNeural'];
 
 function addBubble(text, who) {
@@ -243,8 +266,8 @@ async function initMic() {
   }
 }
 
-micBtn.addEventListener('mousedown', ()=>{ pressed=true; startRec(); });
-micBtn.addEventListener('touchstart', e=>{e.preventDefault(); pressed=true; unlockAudio(); startRec();}, {passive:false});
+micBtn.addEventListener('mousedown', ()=>{ pressed=true; interrupt(); startRec(); });
+micBtn.addEventListener('touchstart', e=>{e.preventDefault(); pressed=true; unlockAudio(); interrupt(); startRec();}, {passive:false});
 function endRec(){ pressed=false; if (recording) stopRec(); }
 micBtn.addEventListener('mouseup', endRec);
 micBtn.addEventListener('mouseleave', endRec);
@@ -344,15 +367,16 @@ async function processAudio(blob) {
 
 async function doBrain(text) {
   setThinking();
+  currentAbort = new AbortController();
   try {
-    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text}), signal: currentAbort.signal});
     if (!r.ok) throw new Error('Brain ' + r.status);
     const rj = await r.json();
     const reply = (rj.reply || '').trim();
     addBubble(reply, 'ai');
     if (autoSpeak) await speak(reply);
   } catch(e) {
-    setMsg('Error: ' + e.message, 'err');
+    if (e.name !== 'AbortError') setMsg('Error: ' + e.message, 'err');
   }
   clearThinking();
   isBusy = false;
@@ -361,17 +385,20 @@ async function doBrain(text) {
 
 async function speak(text) {
   setStatus('Speaking…');
+  speaking = true;
+  currentAbort = currentAbort || new AbortController();
   try {
-    const r = await fetch(API + '/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: lastSession})});
+    const r = await fetch(API + '/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: lastSession}), signal: currentAbort.signal});
     if (!r.ok) throw new Error('TTS ' + r.status);
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     // reuse the persistent element (autoplay already unlocked)
     audioEl.src = url;
-    audioEl.onended = () => { URL.revokeObjectURL(url); if (!recording) setStatus('Mic ready','on'); };
+    audioEl.onended = () => { URL.revokeObjectURL(url); if (!recording) setStatus('Mic ready','on'); speaking=false; };
     await audioEl.play();
+    speaking = false;
   } catch(e) {
-    setMsg('TTS error: ' + e.message, 'err');
+    if (e.name !== 'AbortError') setMsg('TTS error: ' + e.message, 'err');
     setStatus('Mic ready', 'on');
   }
 }
@@ -381,7 +408,7 @@ voicePick.addEventListener('change', ()=>{ /* toggle server uses default; could 
 
 // keyboard: space to talk while focus elsewhere
 document.addEventListener('keydown', async e=>{
-  if (e.code==='Space' && document.activeElement!==typeInput && !e.repeat && !isBusy) { e.preventDefault(); pressed=true; if (!stream) await initMic(); startRec(); }
+  if (e.code==='Space' && document.activeElement!==typeInput && !e.repeat && !isBusy) { e.preventDefault(); pressed=true; interrupt(); if (!stream) await initMic(); startRec(); }
 });
 document.addEventListener('keyup', e=>{ if (e.code==='Space') { pressed=false; endRec(); } });
 
