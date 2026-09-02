@@ -242,17 +242,22 @@ async function initMic() {
 }
 
 micBtn.addEventListener('mousedown', startRec);
-micBtn.addEventListener('touchstart', e=>{e.preventDefault(); startRec();}, {passive:false});
+micBtn.addEventListener('touchstart', e=>{e.preventDefault(); unlockAudio(); startRec();}, {passive:false});
 function endRec(){ if (recording) stopRec(); }
 micBtn.addEventListener('mouseup', endRec);
 micBtn.addEventListener('mouseleave', endRec);
 micBtn.addEventListener('touchend', e=>{e.preventDefault(); endRec();}, {passive:false});
+micBtn.addEventListener('mousedown', unlockAudio);
 
 async function startRec() {
   if (isBusy) return;
   if (!stream) return;
   chunks = [];
-  mediaRec = new MediaRecorder(stream);
+  // Pick the browser's native recording mime (iOS Safari = audio/mp4, not webm)
+  const preferred = ['audio/webm,codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
+  let mime = '';
+  for (const m of preferred) { if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) { mime = m; break; } }
+  mediaRec = new MediaRecorder(stream, mime ? {mimeType: mime} : undefined);
   mediaRec.ondataavailable = e => { if (e.data.size>0) chunks.push(e.data); };
   mediaRec.onstop = onRecStop;
   mediaRec.start();
@@ -261,8 +266,9 @@ async function startRec() {
   listenEl.textContent = 'Listening…';
   // reset after 12s
   recTimeout = setTimeout(()=>{ if (recording) stopRec(); }, 12000);
-  // live waveform via analyser
+  // live waveform via analyser (iOS: resume inside gesture)
   const ctx = new AudioContext();
+  if (ctx.state === 'suspended') { try { await ctx.resume(); } catch(e){} }
   const src = ctx.createMediaStreamSource(stream);
   const ana = ctx.createAnalyser(); ana.fftSize = 256;
   src.connect(ana);
@@ -300,8 +306,13 @@ async function processAudio(blob) {
   isBusy = true;
   setStatus('Transcribing…');
   try {
+    const mime = (mediaRec && mediaRec.mimeType) || blob.type || 'audio/webm';
+    let ext = 'webm';
+    if (mime.includes('mp4') || mime.includes('m4a')) ext = 'm4a';
+    else if (mime.includes('ogg')) ext = 'ogg';
+    else if (mime.includes('wav')) ext = 'wav';
     const fd = new FormData();
-    fd.append('file', blob, 'audio.webm');
+    fd.append('file', blob, 'audio.' + ext);
     const s = await fetch(API + '/stt', {method:'POST', body:fd});
     if (!s.ok) throw new Error('STT ' + s.status);
     const sj = await s.json();
