@@ -89,7 +89,8 @@ SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "You are Mudit's personal Hermes voice assistant, speaking out loud. "
     "Keep replies short, conversational, and natural — 1-3 sentences. "
-    "Do not use markdown, bullets, or emojis. Answer as if speaking.",
+    "Do not use markdown, bullets, or emojis. Answer as if speaking. "
+    "Always respond in English, even if the user speaks another language.",
 )
 
 DEFAULT_USER = os.environ.get("DEFAULT_USER", "there")
@@ -121,12 +122,11 @@ async def stt(file: UploadFile = File(...)):
     if not data:
         raise HTTPException(400, "empty audio")
 
-    # webm/ogg from MediaRecorder — Groq accepts these. Convert to wav/mp3 if needed.
+    # webm/ogg/mp4 from MediaRecorder — Groq accepts these (language pinned to English).
     ext = Path(file.filename or "audio.webm").suffix or ".webm"
-    # Groq wants bytes with a content-type hint; multipart handles it.
     async with httpx.AsyncClient(timeout=60) as client:
         files = {"file": (f"audio{ext}", io.BytesIO(data))}
-        data_ = {"model": GROQ_MODEL, "temperature": "0"}
+        data_ = {"model": GROQ_MODEL, "temperature": "0", "language": "en"}
         r = await client.post(
             GROQ_URL,
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
