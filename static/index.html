@@ -275,6 +275,51 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ---------- MOBILE OPTIMIZATION (≤768px) ---------- */
+@media (max-width: 768px) {
+  body { overscroll-behavior: none; }
+  /* header: compact, still readable */
+  header { padding: 10px 12px 6px; gap: 7px 10px; }
+  .brand { gap: 9px; }
+  .core-orb { width: 30px; height: 30px; }
+  .brand h1 { font-size: 13px; letter-spacing: 1.6px; }
+  .brand .sub { font-size: 9px; letter-spacing: 1.4px; }
+  .chip { font-size: 10px; padding: 7px 9px; min-height: 34px; display: inline-flex; align-items: center; }
+  .crew-toggle { padding: 7px 11px; min-height: 44px; display: inline-flex; align-items: center; }
+
+  main { padding: 0 10px 8px; gap: 8px; }
+  .core-head { padding: 8px 12px; }
+  .core-head .lbl { font-size: 9px; }
+  .conv { padding: 12px 12px; gap: 10px; }
+
+  /* dock: tighter, larger targets */
+  .dock { padding: 10px 10px 8px; gap: 8px; }
+  .dock-mic { gap: 10px; }
+  .waveform { width: 88px; }
+  .pulse-ring { width: 56px; height: 56px; }
+  .mic-btn { inset: 5px; }
+  .mic-btn svg { width: 22px; height: 22px; }
+  .listening-line { font-size: 11px; }
+
+  /* controls: ≥44px touch height */
+  .dock-controls { gap: 8px; }
+  .voice-pick, .action {
+    min-height: 44px; padding: 0 12px; font-size: 13px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .voice-pick { max-width: none; flex: 1 1 40%; }
+  #autoSpeak, #sessionsBtn { flex: 1 1 auto; }
+
+  /* typebar: hero input, ≥44px, 16px text (stops iOS auto-zoom) */
+  .typebar { padding: 8px 10px; border-radius: 12px; }
+  .typebar textarea { font-size: 16px !important; min-height: 44px; padding: 10px 6px; }
+  #sendBtn { width: 48px; height: 48px; border-radius: 12px; }
+  #sendBtn svg { width: 20px; height: 20px; }
+
+  footer { font-size: 8.5px; padding: 2px 0 6px; }
+}
+
 </style>
 </head>
 <body>
