@@ -771,11 +771,13 @@ async function startSeamless() {
 function stopSeamless() {
   seamless = false;
   if (seamlessLoop) { cancelAnimationFrame(seamlessLoop); seamlessLoop=null; }
+  // if a seamless utterance is mid-flight, kill it so it can't come back and confuse normal mode
+  if (currentAbort) { try { currentAbort.abort(); } catch(e){} currentAbort = null; }
   if (recording) { discardNext = true; stopRec(); }
   if (seamlessCtx) { try { seamlessCtx.close(); } catch(e){} seamlessCtx = null; }
   // release the mic when leaving seamless (hands-free ownership ends)
   if (stream) stream.getAudioTracks().forEach(t=>{ try{ t.stop(); }catch(e){} });
-  uttering=false; vadSilenceMs=0; vadLevel=0;
+  uttering=false; vadSilenceMs=0; vadLevel=0; speaking=false;
   syncSeamlessBtn();
   setMode('STANDBY');
   listenEl.textContent='';
