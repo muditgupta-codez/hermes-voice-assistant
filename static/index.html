@@ -107,6 +107,60 @@ main { width: 100%; max-width: 640px; padding: 10px 22px 24px; flex: 1; display:
 footer { padding: 14px; font-size: 11px; color: var(--ink-dim); text-align:center; }
 .msg { font-size: 12px; text-align:center; margin-top: 8px; min-height: 16px; }
 .msg.err { color: var(--red); }
+
+/* --- session history panel --- */
+.session-panel {
+  width: 100%; max-width: 640px;
+  background: var(--card); border-radius: var(--radius);
+  border: 1px solid rgba(255,255,255,.06); box-shadow: var(--shadow);
+  padding: 16px; margin-bottom: 14px;
+}
+.panel-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+.panel-head span { font-weight:600; font-size:15px; }
+.panel-actions { display:flex; gap:8px; }
+.session-list { max-height: 300px; overflow-y:auto; display:flex; flex-direction:column; gap:6px; }
+.session-item {
+  display:flex; align-items:center; gap:10px;
+  padding:10px 12px; border-radius:12px;
+  background: rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07);
+  cursor:pointer; transition: background .15s, border-color .15s;
+}
+.session-item:hover { background: rgba(255,255,255,.08); }
+.session-item.active { border-color: var(--accent); background: rgba(108,123,255,.12); }
+.session-item .s-main { flex:1; min-width:0; }
+.session-item .s-title { font-size:14px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.session-item .s-meta { font-size:11px; color:var(--ink-dim); }
+.session-item .s-del {
+  flex-shrink:0; background:transparent; border:1px solid rgba(255,107,107,.4);
+  color:var(--red); border-radius:9px; padding:4px 9px; font-size:12px; cursor:pointer;
+  transition: background .15s;
+}
+.session-item .s-del:hover { background: rgba(255,107,107,.15); }
+.session-empty { padding: 24px; text-align:center; color: var(--ink-dim); font-size: 13px; }
+.session-hint { margin-top: 12px; font-size: 11px; color: var(--ink-dim); text-align:center; }
+.session-hint strong { color: var(--ink); }
+
+/* --- type bar (always available) --- */
+.typebar {
+  display:flex; align-items:flex-end; gap:10px;
+  width:100%; max-width:640px; margin-top: 12px;
+  padding:10px 14px; border-radius: var(--radius);
+  background: var(--card); border:1px solid rgba(255,255,255,.07);
+}
+.typebar textarea {
+  flex:1; resize:none; border:none; outline:none; background:transparent;
+  color: var(--ink); font: inherit; font-size: 15px; line-height:1.4;
+  max-height: 120px; padding: 6px 0;
+}
+.typebar textarea::placeholder { color: var(--ink-dim); }
+#sendBtn {
+  flex-shrink:0; width:44px; height:42px; border-radius:12px; border:none; cursor:pointer;
+  background: linear-gradient(135deg, var(--accent), var(--accent2)); color:#fff;
+  font-size:17px; display:flex; align-items:center; justify-content:center;
+  transition: transform .15s, opacity .2s;
+}
+#sendBtn:hover { transform: scale(1.05); }
+#sendBtn:disabled { opacity:.5; cursor:not-allowed; }
 </style>
 </head>
 <body>
@@ -138,14 +192,31 @@ footer { padding: 14px; font-size: 11px; color: var(--ink-dim); text-align:cente
         <div class="hint"><strong>Hold</strong> the mic, or <strong>type</strong> below</div>
       </div>
       <div class="controls">
-        <select id="voice" class="voice-pick" title="Voice"></select>
-        <button class="action" id="autoSpeak">🔊 Auto-speak: On</button>
-      </div>
+      <select id="voice" class="voice-pick" title="Voice"></select>
+      <button class="action" id="autoSpeak">🔊 Auto-speak: On</button>
+      <button class="action" id="sessionsBtn">🗂 Sessions</button>
     </div>
   </div>
+</div>
 
-  <div class="msg" id="msg"></div>
-  <textarea id="typeInput" placeholder="Type a message… (Enter to send)" style="display:none"></textarea>
+<!-- Session history panel (hidden until opened) -->
+<div class="session-panel" id="sessionPanel" style="display:none">
+  <div class="panel-head">
+    <span>Past sessions</span>
+    <div class="panel-actions">
+      <button class="action" id="refreshSessions">↻ Refresh</button>
+      <button class="action" id="closeSessions">✕ Close</button>
+    </div>
+  </div>
+  <div class="session-list" id="sessionList"></div>
+  <div class="session-hint">Select a session to <strong>resume</strong> it · <strong>Delete</strong> removes it permanently. New messages go to the current session.</div>
+</div>
+
+<div class="msg" id="msg"></div>
+<div class="typebar" id="typeBar" style="display:none">
+  <textarea id="typeInput" placeholder="Type a message… (Enter to send)" rows="1"></textarea>
+  <button id="sendBtn" aria-label="Send">➤</button>
+</div>
 </main>
 
 <footer>Powered by Hermes agent · Groq STT · edge-tts</footer>
@@ -161,6 +232,16 @@ const listenEl = document.getElementById('listen');
 const voicePick = document.getElementById('voice');
 const autoSpeakBtn = document.getElementById('autoSpeak');
 const typeInput = document.getElementById('typeInput');
+const sendBtn = document.getElementById('sendBtn');
+const typeBar = document.getElementById('typeBar');
+const sessionsBtn = document.getElementById('sessionsBtn');
+const sessionPanel = document.getElementById('sessionPanel');
+const sessionList = document.getElementById('sessionList');
+const refreshSessions = document.getElementById('refreshSessions');
+const closeSessions = document.getElementById('closeSessions');
+
+// current session id — the one new messages go to
+let currentSessionId = (()=>{ let s = localStorage.getItem('hsess'); if (!s) { s = 'v_'+crypto.randomUUID(); localStorage.setItem('hsess', s); } return s; })();
 
 let autoSpeak = true;
 let recording = false, recTimeout = null;
@@ -168,7 +249,6 @@ let mediaRec = null, chunks = [], stream = null;
 let isBusy = false;
 let starting = false;
 let pressed = false;
-let lastSession = (()=>{ let s = localStorage.getItem('hsess'); if (!s) { s = 'v_'+crypto.randomUUID(); localStorage.setItem('hsess', s); } return s; })();
 
 // --- audio playback (persistent element + autoplay unlock) ---
 // The TTS reply takes ~3-4s to generate, so by the time we call play() the
@@ -222,6 +302,9 @@ function addBubble(text, who) {
   b.scrollIntoView({behavior:'smooth', block:'end'});
   return b;
 }
+function escapeHtml(s) {
+  return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 function setStatus(t, cls) { statusEl.textContent = t; statusEl.className = 'status' + (cls?' '+cls:''); }
 function setThinking() {
   statusEl.textContent = 'Thinking';
@@ -262,7 +345,7 @@ async function initMic() {
   } catch(e) {
     setStatus('Mic blocked — type instead', 'err');
     setMsg('Allow microphone access to talk. You can still type below.', 'err');
-    typeInput.style.display = 'block';
+    showTypeBar(true);
   }
 }
 
@@ -369,7 +452,7 @@ async function doBrain(text) {
   setThinking();
   currentAbort = new AbortController();
   try {
-    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: lastSession}), signal: currentAbort.signal});
+    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: currentSessionId}), signal: currentAbort.signal});
     if (!r.ok) throw new Error('Brain ' + r.status);
     const rj = await r.json();
     const reply = (rj.reply || '').trim();
@@ -388,7 +471,7 @@ async function speak(text) {
   speaking = true;
   currentAbort = currentAbort || new AbortController();
   try {
-    const r = await fetch(API + '/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: lastSession}), signal: currentAbort.signal});
+    const r = await fetch(API + '/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: currentSessionId}), signal: currentAbort.signal});
     if (!r.ok) throw new Error('TTS ' + r.status);
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
@@ -412,27 +495,134 @@ document.addEventListener('keydown', async e=>{
 });
 document.addEventListener('keyup', e=>{ if (e.code==='Space') { pressed=false; endRec(); } });
 
-// text fallback
-typeInput.addEventListener('keydown', async e=>{
-  if (e.key==='Enter' && !e.shiftKey) {
-    e.preventDefault();
-    const t = typeInput.value.trim();
-    if (!t) return;
-    typeInput.value='';
-    addBubble(t,'user');
-    setThinking();
-    isBusy = true;
-    try {
-      const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t, session_id: lastSession})});
-      if (!r.ok) throw new Error('Brain '+r.status);
-      const rj = await r.json();
-      addBubble((rj.reply||'').trim(),'ai');
-      if (autoSpeak) await speak(rj.reply.trim());
-    } catch(err){ setMsg('Error: '+err.message,'err'); }
-    clearThinking();
-    isBusy=false; setStatus('Mic ready','on');
-  }
+// ---- text input (always available) ----
+function showTypeBar(show) {
+  typeBar.style.display = show ? 'flex' : 'none';
+  if (show) typeInput.focus();
+}
+// Always show the type bar on load (don't gate it behind mic failure anymore).
+window.addEventListener('load', ()=> showTypeBar(true));
+if (window.innerWidth <= 768) showTypeBar(true);
+
+function autoGrow() {
+  typeInput.style.height = 'auto';
+  typeInput.style.height = Math.min(typeInput.scrollHeight, 120) + 'px';
+}
+typeInput.addEventListener('input', autoGrow);
+typeInput.addEventListener('keydown', e=>{
+  if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendTyped(); }
 });
+sendBtn.addEventListener('click', sendTyped);
+
+async function sendTyped() {
+  const t = typeInput.value.trim();
+  if (!t) return;
+  typeInput.value=''; autoGrow(); sendBtn.disabled = true;
+  addBubble(t,'user');
+  await doBrain(t);
+  sendBtn.disabled = false;
+  typeInput.focus();
+}
+
+// ---- session history panel ----
+function fmtWhen(ts){
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d)) return '';
+  const now = new Date();
+  const ms = now - d;
+  if (ms < 60000) return 'just now';
+  if (ms < 3600000) return Math.floor(ms/60000)+'m ago';
+  if (ms < 86400000) return Math.floor(ms/3600000)+'h ago';
+  return d.toLocaleDateString(undefined, {month:'short', day:'numeric'}) + ' ' + d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
+}
+
+async function fetchSessions() {
+  try {
+    const r = await fetch(API + '/api/sessions?limit=100');
+    if (!r.ok) throw new Error('list ' + r.status);
+    const j = await r.json();
+    return j.data || [];
+  } catch(e){ setMsg('Failed to load sessions: '+e.message, 'err'); return []; }
+}
+
+function renderSessions(sessions) {
+  if (!sessions.length) { sessionList.innerHTML = '<div class="session-empty">No past sessions yet — start talking or typing.</div>'; return; }
+  sessionList.innerHTML = '';
+  sessions.forEach(s=>{
+    const title = s.title && s.title.trim() ? s.title : s.id;
+    const item = document.createElement('div');
+    item.className = 'session-item' + (s.id===currentSessionId ? ' active' : '');
+    item.innerHTML = `
+      <div class="s-main" title="${escapeHtml(title)}">
+        <div class="s-title">${escapeHtml(title)}</div>
+        <div class="s-meta">${s.message_count||0} msgs · ${fmtWhen(s.last_active||s.started_at)}</div>
+      </div>
+      <button class="s-del" title="Delete session">Delete</button>`;
+    // click row → resume
+    item.addEventListener('click', ()=> resumeSession(s));
+    // click delete → confirm + delete
+    const delBtn = item.querySelector('.s-del');
+    delBtn.addEventListener('click', async (e)=>{
+      e.stopPropagation();
+      if (!confirm('Delete this session? Its history will be removed permanently.')) return;
+      delBtn.disabled = true; delBtn.textContent = '…';
+      try {
+        const dr = await fetch(API + '/api/sessions/' + encodeURIComponent(s.id), {method:'DELETE'});
+        if (!dr.ok) throw new Error('delete ' + dr.status);
+        if (s.id === currentSessionId) { startNewSession(); }
+        await loadSessions();
+      } catch(err){ setMsg('Delete failed: '+err.message,'err'); delBtn.disabled=false; delBtn.textContent='Delete'; }
+    });
+    sessionList.appendChild(item);
+  });
+}
+
+async function loadSessions() {
+  const sessions = await fetchSessions();
+  renderSessions(sessions);
+}
+
+async function resumeSession(s) {
+  currentSessionId = s.id;
+  localStorage.setItem('hsess', s.id);
+  conv.innerHTML = '';
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(s.id) + '/messages?limit=300');
+    if (!r.ok) throw new Error('msgs ' + r.status);
+    const j = await r.json();
+    const arr = (j.data || []);
+    let shown = 0;
+    for (const m of arr) {
+      const role = m.role;
+      if (role !== 'user' && role !== 'assistant') continue;
+      let text = m.content;
+      if (Array.isArray(text)) text = text.map(p=> p && p.text ? p.text : '').join(' ');
+      if (!text || !text.trim()) continue;
+      addBubble(text.trim(), role==='user'?'user':'ai');
+      shown++;
+    }
+    if (!shown) addBubble('(empty session)','ai');
+  } catch(e){ setMsg('Failed to load history: '+e.message,'err'); }
+  await loadSessions();
+  setMsg('');
+}
+
+function startNewSession() {
+  currentSessionId = 'v_' + crypto.randomUUID();
+  localStorage.setItem('hsess', currentSessionId);
+  conv.innerHTML = '';
+  typeInput.focus();
+}
+
+// panel open/close
+sessionsBtn.addEventListener('click', async ()=>{
+  const open = sessionPanel.style.display !== 'none';
+  if (open) { sessionPanel.style.display = 'none'; sessionsBtn.textContent = '🗂 Sessions'; }
+  else { sessionPanel.style.display = 'block'; sessionsBtn.textContent = '🗂 Close'; await loadSessions(); }
+});
+refreshSessions.addEventListener('click', loadSessions);
+closeSessions.addEventListener('click', ()=>{ sessionPanel.style.display='none'; sessionsBtn.textContent='🗂 Sessions'; });
 
 // health + init
 async function boot(){

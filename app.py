@@ -234,6 +234,86 @@ async def tts(req: BrainRequest):
     return Response(content=data, media_type="audio/mpeg")
 
 
+# ---------- SESSION MANAGEMENT (proxy to the Hermes api_server) ----------
+# The browser cannot reach the brain host directly (the auth key must stay on the
+# server, and the brain may be on an internal docker network). So the frontend
+# calls these same-origin routes and app.py proxies to the api_server's session
+# REST API. Verified live against the brain: GET /api/sessions (list), GET
+# /api/sessions/{id}/messages (history), DELETE /api/sessions/{id} (delete).
+#
+# We surface only source == 'api_server' sessions — those are the ones the web
+# voice app itself creates via /v1/runs with a client-side session_id (v_<uuid>).
+# Other sources (whatsapp/discord/cron) are the gateway's own conversations and
+# don't belong in this app's picker.
+
+async def _session_api_base() -> tuple[str, str]:
+    """Return (api_base_url, key) for the api_server session REST API."""
+    host, port, _idx = await find_brain_host()
+    return f"http://{host}:{port}/api", BRAIN_KEY
+
+
+@app.get("/api/sessions")
+async def api_sessions(limit: int = 100, offset: int = 0):
+    base, key = await _session_api_base()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                f"{base}/sessions",
+                params={"limit": 1000, "offset": 0},
+                headers={"Authorization": f"Bearer {key}"},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Brain unreachable: {e}")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, r.text[:300])
+    rows = [s for s in r.json().get("data", []) if s.get("source") == "api_server"]
+    rows.sort(
+        key=lambda s: s.get("last_active") or s.get("started_at") or "",
+        reverse=True,
+    )
+    filtered = rows[offset : offset + limit]
+    return {
+        "object": "list",
+        "data": filtered,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + limit) < len(rows),
+    }
+
+
+@app.get("/api/sessions/{sid}/messages")
+async def api_session_messages(sid: str, limit: int = 300):
+    base, key = await _session_api_base()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                f"{base}/sessions/{sid}/messages",
+                params={"limit": limit},
+                headers={"Authorization": f"Bearer {key}"},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Brain unreachable: {e}")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, r.text[:300])
+    return r.json()
+
+
+@app.delete("/api/sessions/{sid}")
+async def api_session_delete(sid: str):
+    base, key = await _session_api_base()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.delete(
+                f"{base}/sessions/{sid}",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+    except Exception as e:
+        raise HTTPException(502, f"Brain unreachable: {e}")
+    if r.status_code not in (200, 204, 404):
+        raise HTTPException(r.status_code, r.text[:300])
+    return {"deleted": True, "id": sid}
+
+
 # ---------- health ----------
 @app.get("/health")
 async def health():
