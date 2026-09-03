@@ -211,6 +211,9 @@ body.crew-open .crew { display: flex; }
   backdrop-filter: blur(6px);
 }
 .dock-mic { display: flex; align-items: center; justify-content: center; gap: 16px; flex-wrap: wrap; }
+/* In hands-free seamless mode there's no hold-to-talk — hide the mic + waveform entirely. */
+body.seamless-active .dock-mic { display: none; }
+body.seamless-active .dock-controls { margin-inline: auto; }
 .waveform { width: 140px; height: 26px; display: flex; align-items: center; justify-content: center; gap: 2px; }
 .waveform span { width: 3px; border-radius: 2px; background: var(--accent); height: 4px; transition: height .08s; }
 .pulse-ring { position: relative; width: 56px; height: 56px; flex-shrink: 0; }
@@ -347,7 +350,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
       </div>
 
       <div class="conv" id="conv">
-        <div class="empty-hint"><b>CORE LINKED</b>Hold the mic to speak, or type a command.<br><span class="cursor">▌</span></div>
+        <div class="empty-hint"><b>CORE LINKED</b>Talk freely — or type a command.<br><span class="cursor">▌</span></div>
       </div>
 
       <div class="msg-line"><div class="msg" id="msg"></div></div>
@@ -670,7 +673,13 @@ const VAD_ON = 0.045;           // level to count as "speaking"
 const VAD_WORD_MS = 700;        // min speak time to qualify as a real utterance
 const VAD_END_MS = 950;         // silence that ends an utterance
 const VAD_MAX_MS = 12000;       // safety cap per utterance
+// Barge-in gating: TTS from the phone speaker leaks into the mic, so a real human
+// interruption must be LOUDER and SUSTAINED before we cut the agent off. This stops
+// the agent from interrupting its own speech (the "seamless isn't working" bug).
+const VAD_BARGE_IN = 0.16;      // louder gate to qualify as a genuine barge-in
+const VAD_BARGE_MS = 260;       // how long the louder gate must hold before cutting off
 let utterStart = 0, utterLastVoice = 0;
+let bargeAccumMs = 0;           // how long the louder-than-TTS signal has persisted
 
 function seamlessAnalyser(stream0) {
   const ctx = new AudioContext();
@@ -692,17 +701,28 @@ function seamlessAnalyser(stream0) {
     }
     const now = Date.now();
     const userSpeaking = vadLevel > VAD_ON;
-    if (userSpeaking) {
-      // BARGE-IN: user spoke while Hermes was talking -> cut it off, capture the interruption
-      if (speaking) {
-        interrupt();
-        setMode('BARGE-IN');
-        setMsg('INTERRUPTED — GO AHEAD.','ok');
+    if (speaking) {
+      // Agent is talking. Only a loud, sustained signal is a genuine interruption —
+      // ignore the TTS leaking through the speaker into the mic.
+      if (vadLevel > VAD_BARGE_IN) {
+        bargeAccumMs += 33;
+        if (bargeAccumMs >= VAD_BARGE_MS) {
+          bargeAccumMs = 0;
+          interrupt();
+          setMode('BARGE-IN');
+          setMsg('INTERRUPTED — GO AHEAD.','ok');
+        }
+      } else {
+        bargeAccumMs = 0;
       }
+    } else {
+      bargeAccumMs = 0;
+    }
+    if (userSpeaking && !speaking) {
       if (!uttering) { uttering = true; utterStart = now; utterLastVoice = now; chunks = []; }
       utterLastVoice = now;
       vadSilenceMs = 0;
-    } else if (uttering) {
+    } else if (uttering && !speaking) {
       vadSilenceMs = now - utterLastVoice;
       const ripe = vadSilenceMs >= VAD_END_MS || (now - utterStart) > VAD_MAX_MS;
       if (ripe && (now - utterStart) >= VAD_WORD_MS) commitUtterance();
@@ -786,6 +806,8 @@ function stopSeamless() {
 function syncSeamlessBtn(){
   seamlessBtn.textContent = 'SEAMLESS: ' + (seamless?'ON':'OFF');
   seamlessBtn.classList.toggle('active', seamless);
+  // In hands-free seamless mode there's no hold-to-talk — hide the mic entirely.
+  document.body.classList.toggle('seamless-active', seamless);
 }
 seamlessBtn.addEventListener('click', ()=>{ seamless ? stopSeamless() : startSeamless(); });
 
