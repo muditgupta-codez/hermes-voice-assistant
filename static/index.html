@@ -389,7 +389,8 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
     </div>
     <div class="dock-controls">
       <select id="voice" class="voice-pick" title="Voice"></select>
-      <button class="action active" id="autoSpeak">AUTO-SPEAK: ON</button>
+      <button class="action" id="autoSpeak" title="Speak the reply aloud">AUTO-SPEAK: ON</button>
+      <button class="action" id="seamlessBtn" title="Hands-free: talk without holding the mic, barge-in allowed">SEAMLESS: OFF</button>
       <button class="action" id="sessionsBtn">🗂 SESSIONS</button>
     </div>
     <div class="typebar" id="typeBar" style="display:none">
@@ -426,6 +427,7 @@ const crewGrid = document.getElementById('crewGrid');
 const crewToggle = document.getElementById('crewToggle');
 const modeReadout = document.getElementById('modeReadout');
 const coreName = document.getElementById('coreName');
+const seamlessBtn = document.getElementById('seamlessBtn');
 
 // current session id — the one new messages go to
 let currentSessionId = (()=>{ let s = localStorage.getItem('hsess'); if (!s) { s = 'v_'+crypto.randomUUID(); localStorage.setItem('hsess', s); } return s; })();
@@ -633,7 +635,8 @@ function stopRec(){
   micBtn.classList.remove('rec');
   listenEl.textContent = '';
   drawWave(null);
-  if (stream) stream.getAudioTracks().forEach(t=>{ try{ t.stop(); }catch(e){} });
+  // In seamless mode the mic stays owned (hands-free); only release tracks for push-to-talk.
+  if (!seamless && stream) stream.getAudioTracks().forEach(t=>{ try{ t.stop(); }catch(e){} });
 }
 
 async function onRecStop() {
@@ -641,6 +644,134 @@ async function onRecStop() {
   if (blob.size < 1000) { setMsg('TOO SHORT — HOLD AFTER SPEAKING.'); isBusy=false; setStatus('MIC READY','on'); setMode('VOICE READY'); return; }
   await processAudio(blob);
 }
+
+/* ==================== SEAMLESS MODE (hands-free, call-style, barge-in) ====================
+   When ON: the mic is owned the whole time. An audio-level gate (VAD) detects when the user
+   starts speaking; when they go silent the utterance is auto-committed. If the user speaks
+   while Hermes is talking, it BARGE-INS: stops the TTS, aborts any in-flight brain call,
+   and captures the interruption. No hold-to-talk, no push-to-talk. */
+let seamless = false;
+let seamlessLoop = null;        // rAF id
+let uttering = false;           // user currently within a speech burst
+let vadSilenceMs = 0;           // time below gate during a burst
+let vadLevel = 0;               // smoothed audio level 0..1
+const VAD_ON = 0.045;           // level to count as "speaking"
+const VAD_WORD_MS = 700;        // min speak time to qualify as a real utterance
+const VAD_END_MS = 950;         // silence that ends an utterance
+const VAD_MAX_MS = 12000;       // safety cap per utterance
+let utterStart = 0, utterLastVoice = 0;
+
+function seamlessAnalyser(stream0) {
+  const ctx = new AudioContext();
+  const src = ctx.createMediaStreamSource(stream0);
+  const ana = ctx.createAnalyser(); ana.fftSize = 512; ana.smoothingTimeConstant = 0.6;
+  src.connect(ana);
+  const data = new Uint8Array(ana.frequencyBinCount);
+  function loop0() {
+    if (!seamless) { ctx.close(); return; }
+    if (stream && stream.getAudioTracks().find(t=>t.readyState==='live')) {
+      ana.getByteFrequencyData(data);
+      let sum=0; for (let i=0;i<data.length;i++) sum+=data[i];
+      vadLevel = (sum/data.length)/255;
+      // draw waveform bars as a live monitor
+      const levels = [];
+      for (let i=0;i<wfBars.length;i++){ const idx=Math.floor(i/wfBars.length*data.length); levels.push(data[idx]/255); }
+      if (!recording) drawWave(levels);
+    }
+    const now = Date.now();
+    const userSpeaking = vadLevel > VAD_ON;
+    if (userSpeaking) {
+      // BARGE-IN: user spoke while Hermes was talking -> cut it off, capture the interruption
+      if (speaking) {
+        interrupt();
+        setMode('BARGE-IN');
+        setMsg('INTERRUPTED — GO AHEAD.','ok');
+      }
+      if (!uttering) { uttering = true; utterStart = now; utterLastVoice = now; chunks = []; }
+      utterLastVoice = now;
+      vadSilenceMs = 0;
+    } else if (uttering) {
+      vadSilenceMs = now - utterLastVoice;
+      const ripe = vadSilenceMs >= VAD_END_MS || (now - utterStart) > VAD_MAX_MS;
+      if (ripe && (now - utterStart) >= VAD_WORD_MS) commitUtterance();
+      else if ((now - utterStart) > VAD_MAX_MS) commitUtterance();
+    }
+    seamlessLoop = requestAnimationFrame(loop0);
+  }
+  loop0();
+}
+
+async function commitUtterance() {
+  uttering=false;
+  // latest speech always wins: if the agent is still mid-turn on a prior utterance,
+  // cut it off (aborts the in-flight brain/TTS) so two turns never overlap.
+  if (isBusy) interrupt();
+  // commit only if we actually captured something this turn
+  if (!recording) { return; }
+  stopRec();               // fires onRecStop -> processAudio -> brain/tts
+  // after the utterance posts, re-arm the seamless recorder for the next turn
+  // (processAudio runs async; re-arm immediately so the listen loop stays continuous)
+  rearmSeamlessRec();
+}
+
+function rearmSeamlessRec() {
+  if (!seamless) return;
+  // brief guard so we don't start a fresh recorder while onRecStop is still finalizing
+  setTimeout(()=>{
+    if (!seamless || recording) return;
+    chunks = [];
+    const preferred = ['audio/webm,codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
+    let mime=''; for (const m of preferred){ if (typeof MediaRecorder!=='undefined' && MediaRecorder.isTypeSupported(m)){ mime=m; break; } }
+    if (!stream || !stream.getAudioTracks().find(t=>t.readyState==='live')) return;
+    mediaRec = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined);
+    mediaRec.ondataavailable = e => { if (e.data.size>0) chunks.push(e.data); };
+    mediaRec.onstop = onRecStop;
+    mediaRec.start(250);
+    recording = true;
+    micBtn.classList.add('rec');
+    listenEl.textContent = 'SEAMLESS · LISTENING';
+  }, 300);
+}
+
+async function startSeamless() {
+  if (!stream || !stream.getAudioTracks().find(t=>t.readyState==='live')) {
+    try { stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
+    catch(e){ setMsg('MIC UNAVAILABLE — SEAMLESS NEEDS MIC ACCESS','err'); seamless=false; syncSeamlessBtn(); return; }
+  }
+  seamless = true;
+  syncSeamlessBtn();
+  setMode('SEAMLESS — SPEAK FREELY');
+  setMsg('SEAMLESS ON — just talk. Barge in anytime.','ok');
+  chunks = [];
+  const preferred = ['audio/webm,codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
+  let mime=''; for (const m of preferred){ if (typeof MediaRecorder!=='undefined' && MediaRecorder.isTypeSupported(m)){ mime=m; break; } }
+  mediaRec = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined);
+  mediaRec.ondataavailable = e => { if (e.data.size>0) chunks.push(e.data); };
+  mediaRec.onstop = onRecStop;
+  mediaRec.start(250);
+  recording = true;
+  micBtn.classList.add('rec');
+  listenEl.textContent = 'SEAMLESS · SPEAK FREELY';
+  uttering=false; vadSilenceMs=0; vadLevel=0;
+  seamlessAnalyser(stream);
+}
+
+function stopSeamless() {
+  seamless = false;
+  if (seamlessLoop) { cancelAnimationFrame(seamlessLoop); seamlessLoop=null; }
+  if (recording) stopRec();
+  uttering=false;
+  syncSeamlessBtn();
+  setMode('STANDBY');
+  listenEl.textContent='';
+}
+
+function syncSeamlessBtn(){
+  seamlessBtn.textContent = 'SEAMLESS: ' + (seamless?'ON':'OFF');
+  seamlessBtn.classList.toggle('active', seamless);
+}
+seamlessBtn.addEventListener('click', ()=>{ seamless ? stopSeamless() : startSeamless(); });
+
 
 async function processAudio(blob) {
   isBusy = true;
