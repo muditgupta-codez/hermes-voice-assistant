@@ -243,6 +243,10 @@ body.seamless-active .dock-controls { margin-inline: auto; }
 .voice-pick:hover, .action:hover, .btn:hover { background: rgba(255,255,255,.07); color: var(--ink); }
 .voice-pick { max-width: 175px; }
 .action.active { color: var(--accent); border-color: rgba(57,216,224,.4); }
+/* hold-to-mute button: hidden normally; shown only in seamless; slate→muted-red when held */
+.mutebtn { background: rgba(255,255,255,.03); border: 1px solid var(--line); }
+.mutebtn.active { color: var(--err); border-color: rgba(255,92,108,.55); background: rgba(255,92,108,.10); }
+.mutebtn[hidden] { display: none !important; }
 
 .typebar {
   display: flex; align-items: flex-end; gap: 8px;
@@ -394,6 +398,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
       <select id="voice" class="voice-pick" title="Voice"></select>
       <button class="action" id="autoSpeak" title="Speak the reply aloud">AUTO-SPEAK: ON</button>
       <button class="action" id="seamlessBtn" title="Hands-free: talk without holding the mic, barge-in allowed">SEAMLESS: OFF</button>
+      <button class="action mutebtn" id="muteBtn" title="Hands-free: hold to mute (agent stops listening)" hidden>HOLD TO MUTE</button>
       <button class="action" id="sessionsBtn">🗂 SESSIONS</button>
     </div>
     <div class="typebar" id="typeBar" style="display:none">
@@ -431,6 +436,7 @@ const crewToggle = document.getElementById('crewToggle');
 const modeReadout = document.getElementById('modeReadout');
 const coreName = document.getElementById('coreName');
 const seamlessBtn = document.getElementById('seamlessBtn');
+const muteBtn = document.getElementById('muteBtn');
 
 // current session id — the one new messages go to
 let currentSessionId = (()=>{ let s = localStorage.getItem('hsess'); if (!s) { s = 'v_'+crypto.randomUUID(); localStorage.setItem('hsess', s); } return s; })();
@@ -666,18 +672,27 @@ let seamless = false;
 let seamlessLoop = null;        // rAF id
 let uttering = false;           // user currently within a speech burst
 let vadSilenceMs = 0;           // time below gate during a burst
-let vadLevel = 0;               // smoothed audio level 0..1
+let vadLevel = 0;               // smoothed audio level 0..1 (RMS)
 let discardNext = false;        // drop the in-flight blob (no phantom utterance) on intentional stop
 let seamlessCtx = null;         // the AudioContext owned by seamlessAnalyser, closed on toggle-off
-const VAD_ON = 0.045;           // level to count as "speaking"
-const VAD_WORD_MS = 700;        // min speak time to qualify as a real utterance
-const VAD_END_MS = 950;         // silence that ends an utterance
+let muted = false;              // hold-to-mute: when held, listening is paused (agent can't hear you)
+const VAD_ON = 0.020;           // RMS level to count as "speaking" (robust; speech is well above this)
+const VAD_WORD_MS = 250;        // min speak time to qualify as a real utterance (short call-like phrases commit)
+const VAD_END_MS = 800;         // silence that ends an utterance (natural mid-conversation pause)
 const VAD_MAX_MS = 12000;       // safety cap per utterance
 // Barge-in gating: TTS from the phone speaker leaks into the mic, so a real human
 // interruption must be LOUDER and SUSTAINED before we cut the agent off. This stops
 // the agent from interrupting its own speech (the "seamless isn't working" bug).
-const VAD_BARGE_IN = 0.16;      // louder gate to qualify as a genuine barge-in
+const VAD_BARGE_IN = 0.10;      // louder RMS gate to qualify as a genuine barge-in
 const VAD_BARGE_MS = 260;       // how long the louder gate must hold before cutting off
+// Use time-domain RMS for the VAD. FFT-mean across all bins dilutes speech energy into
+// a sub-threshold value (the reason "I speak and nothing happens"), so measuring the
+// RMS amplitude of the raw waveform is far more robust for speech-vs-silence.
+function vadRms(arr) {
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) { const s = (arr[i] - 128) / 128; sum += s * s; }
+  return Math.sqrt(sum / arr.length);
+}
 let utterStart = 0, utterLastVoice = 0;
 let bargeAccumMs = 0;           // how long the louder-than-TTS signal has persisted
 
@@ -687,17 +702,23 @@ function seamlessAnalyser(stream0) {
   const src = ctx.createMediaStreamSource(stream0);
   const ana = ctx.createAnalyser(); ana.fftSize = 512; ana.smoothingTimeConstant = 0.6;
   src.connect(ana);
+  // RMS needs the raw time-domain waveform. Use a separate downsampled buffer.
+  const wave = new Uint8Array(ana.fftSize);
   const data = new Uint8Array(ana.frequencyBinCount);
   function loop0() {
     if (!seamless) { ctx.close(); return; }
     if (stream && stream.getAudioTracks().find(t=>t.readyState==='live')) {
+      // Grab BOTH the raw waveform (for RMS) and the frequency data (for the wave bars).
+      ana.getByteTimeDomainData(wave);
       ana.getByteFrequencyData(data);
-      let sum=0; for (let i=0;i<data.length;i++) sum+=data[i];
-      vadLevel = (sum/data.length)/255;
-      // draw waveform bars as a live monitor
+      const rawLevel = vadRms(wave);
+      // Smoothed level: RMS is nosier frame-to-frame, so decay slowly, rise instantly.
+      vadLevel = rawLevel > vadLevel ? rawLevel : (vadLevel * 0.85 + rawLevel * 0.15);
+      // Draw waveform bars as a live monitor (frequency-domain for the nice bars).
       const levels = [];
       for (let i=0;i<wfBars.length;i++){ const idx=Math.floor(i/wfBars.length*data.length); levels.push(data[idx]/255); }
       if (!recording) drawWave(levels);
+      if (muted) { vadLevel = 0; }  // hold-to-mute: pretend the mic is silent
     }
     const now = Date.now();
     const userSpeaking = vadLevel > VAD_ON;
@@ -724,9 +745,8 @@ function seamlessAnalyser(stream0) {
       vadSilenceMs = 0;
     } else if (uttering && !speaking) {
       vadSilenceMs = now - utterLastVoice;
-      const ripe = vadSilenceMs >= VAD_END_MS || (now - utterStart) > VAD_MAX_MS;
+      const ripe = (vadSilenceMs >= VAD_END_MS && !muted) || (now - utterStart) > VAD_MAX_MS;
       if (ripe && (now - utterStart) >= VAD_WORD_MS) commitUtterance();
-      else if ((now - utterStart) > VAD_MAX_MS) commitUtterance();
     }
     seamlessLoop = requestAnimationFrame(loop0);
   }
@@ -761,7 +781,7 @@ function rearmSeamlessRec() {
     mediaRec.start(250);
     recording = true;
     micBtn.classList.add('rec');
-    listenEl.textContent = 'SEAMLESS · LISTENING';
+    listenEl.textContent = 'SEAMLESS';
   }, 300);
 }
 
@@ -771,9 +791,9 @@ async function startSeamless() {
     catch(e){ setMsg('MIC UNAVAILABLE — SEAMLESS NEEDS MIC ACCESS','err'); seamless=false; syncSeamlessBtn(); return; }
   }
   seamless = true;
+  muted = false;
   syncSeamlessBtn();
-  setMode('SEAMLESS — SPEAK FREELY');
-  setMsg('SEAMLESS ON — just talk. Barge in anytime.','ok');
+  setMode('SEAMLESS');
   chunks = [];
   const preferred = ['audio/webm,codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
   let mime=''; for (const m of preferred){ if (typeof MediaRecorder!=='undefined' && MediaRecorder.isTypeSupported(m)){ mime=m; break; } }
@@ -783,7 +803,7 @@ async function startSeamless() {
   mediaRec.start(250);
   recording = true;
   micBtn.classList.add('rec');
-  listenEl.textContent = 'SEAMLESS · SPEAK FREELY';
+  listenEl.textContent = 'SEAMLESS';
   uttering=false; vadSilenceMs=0; vadLevel=0;
   seamlessAnalyser(stream);
 }
@@ -797,7 +817,7 @@ function stopSeamless() {
   if (seamlessCtx) { try { seamlessCtx.close(); } catch(e){} seamlessCtx = null; }
   // release the mic when leaving seamless (hands-free ownership ends)
   if (stream) stream.getAudioTracks().forEach(t=>{ try{ t.stop(); }catch(e){} });
-  uttering=false; vadSilenceMs=0; vadLevel=0; speaking=false;
+  uttering=false; vadSilenceMs=0; vadLevel=0; speaking=false; muted=false;
   syncSeamlessBtn();
   setMode('STANDBY');
   listenEl.textContent='';
@@ -808,8 +828,19 @@ function syncSeamlessBtn(){
   seamlessBtn.classList.toggle('active', seamless);
   // In hands-free seamless mode there's no hold-to-talk — hide the mic entirely.
   document.body.classList.toggle('seamless-active', seamless);
+  // Show the hold-to-mute button only while seamless is on (there's no push-to-talk,
+  // but you still want a quick way to stop Hermes from hearing you).
+  muteBtn.hidden = !seamless;
+  muteBtn.classList.toggle('active', muted);
+  muteBtn.textContent = muted ? 'MUTED' : 'HOLD TO MUTE';
 }
 seamlessBtn.addEventListener('click', ()=>{ seamless ? stopSeamless() : startSeamless(); });
+// Hold-to-mute: mouse + touch, same as the mic.
+muteBtn.addEventListener('mousedown', ()=>{ muted = true; uttering=false; vadSilenceMs=0; vadLevel=0; syncSeamlessBtn(); });
+muteBtn.addEventListener('mouseup', ()=>{ muted = false; syncSeamlessBtn(); });
+muteBtn.addEventListener('mouseleave', ()=>{ muted = false; syncSeamlessBtn(); });
+muteBtn.addEventListener('touchstart', e=>{ e.preventDefault(); muted = true; uttering=false; vadSilenceMs=0; vadLevel=0; syncSeamlessBtn(); }, {passive:false});
+muteBtn.addEventListener('touchend', e=>{ e.preventDefault(); muted = false; syncSeamlessBtn(); }, {passive:false});
 
 
 async function processAudio(blob) {
