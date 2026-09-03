@@ -640,6 +640,15 @@ function stopRec(){
 }
 
 async function onRecStop() {
+  // If we intentionally discarded (e.g. toggling seamless off), drop the blob and
+  // reset cleanly WITHOUT committing a phantom utterance or entering isBusy.
+  if (discardNext) {
+    discardNext = false; chunks = [];
+    isBusy = false; setStatus('MIC READY','on'); setMode('VOICE READY');
+    listenEl.textContent = '';
+    micBtn.classList.remove('rec');
+    return;
+  }
   const blob = new Blob(chunks, {type: mediaRec.mimeType || 'audio/webm'});
   if (blob.size < 1000) { setMsg('TOO SHORT — HOLD AFTER SPEAKING.'); isBusy=false; setStatus('MIC READY','on'); setMode('VOICE READY'); return; }
   await processAudio(blob);
@@ -655,6 +664,8 @@ let seamlessLoop = null;        // rAF id
 let uttering = false;           // user currently within a speech burst
 let vadSilenceMs = 0;           // time below gate during a burst
 let vadLevel = 0;               // smoothed audio level 0..1
+let discardNext = false;        // drop the in-flight blob (no phantom utterance) on intentional stop
+let seamlessCtx = null;         // the AudioContext owned by seamlessAnalyser, closed on toggle-off
 const VAD_ON = 0.045;           // level to count as "speaking"
 const VAD_WORD_MS = 700;        // min speak time to qualify as a real utterance
 const VAD_END_MS = 950;         // silence that ends an utterance
@@ -663,6 +674,7 @@ let utterStart = 0, utterLastVoice = 0;
 
 function seamlessAnalyser(stream0) {
   const ctx = new AudioContext();
+  seamlessCtx = ctx;
   const src = ctx.createMediaStreamSource(stream0);
   const ana = ctx.createAnalyser(); ana.fftSize = 512; ana.smoothingTimeConstant = 0.6;
   src.connect(ana);
@@ -759,8 +771,11 @@ async function startSeamless() {
 function stopSeamless() {
   seamless = false;
   if (seamlessLoop) { cancelAnimationFrame(seamlessLoop); seamlessLoop=null; }
-  if (recording) stopRec();
-  uttering=false;
+  if (recording) { discardNext = true; stopRec(); }
+  if (seamlessCtx) { try { seamlessCtx.close(); } catch(e){} seamlessCtx = null; }
+  // release the mic when leaving seamless (hands-free ownership ends)
+  if (stream) stream.getAudioTracks().forEach(t=>{ try{ t.stop(); }catch(e){} });
+  uttering=false; vadSilenceMs=0; vadLevel=0;
   syncSeamlessBtn();
   setMode('STANDBY');
   listenEl.textContent='';
