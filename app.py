@@ -124,7 +124,25 @@ class BrainRequest(BaseModel):
 #   5xx -> retry once, then 503 + Retry-After (client retries, then stays quiet)
 # Outcome counters + the last non-routine error ride along in /health so a failure can be
 # attributed from outside the container (Coolify only keeps the current container's log).
-STT_DIAG = {"counts": {}, "last_error": None}
+STT_DIAG = {"counts": {}, "last_error": None, "last_blob": None}
+
+
+def _sniff_container(data):
+    """Name the container from its magic bytes. A blob Groq refuses can then be identified
+    from /health alone — Coolify only keeps the running container's log, so a failure that
+    scrolled past, or happened before a deploy, is otherwise unattributable."""
+    h = data[:16]
+    if h[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm/matroska"
+    if h[4:8] == b"ftyp":
+        return "mp4/mov"
+    if h[:4] == b"OggS":
+        return "ogg"
+    if h[:4] == b"RIFF":
+        return "wav"
+    if h[:3] == b"ID3":
+        return "mp3"
+    return "unknown"
 
 
 def _stt_note(outcome, **extra):
@@ -141,6 +159,11 @@ async def stt(file: UploadFile = File(...)):
     data = await file.read()
     if not data:
         raise HTTPException(400, "empty audio")
+
+    # What actually arrived, for every single utterance (not just failures).
+    STT_DIAG["last_blob"] = {"when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                             "container": _sniff_container(data), "head": data[:12].hex(),
+                             "bytes": len(data), "name": file.filename or ""}
 
     # webm/ogg/mp4 from MediaRecorder — Groq accepts these (language pinned to English).
     ext = Path(file.filename or "audio.webm").suffix or ".webm"
@@ -174,7 +197,8 @@ async def stt(file: UploadFile = File(...)):
             # Groq could not decode the blob at all — a truncated/odd container from the
             # recorder, not a user-facing failure. Behave exactly like silence.
             log.warning("groq stt undecodable (400): %s", last.text[:200])
-            _stt_note("silent", detail=last.text[:200], bytes=len(data))
+            _stt_note("undecodable", detail=last.text[:200], bytes=len(data),
+                      container=_sniff_container(data))
             return {"text": "", "reason": "undecodable", "bytes": len(data)}
         if attempt == 0:                            # transient upstream blip: one retry
             log.warning("groq stt %s — retrying once", last.status_code)
@@ -464,7 +488,10 @@ async def health():
             "tts": bool(TTS_VOICE), "brain_url": BRAIN_URL, "probe": probe,
             # STT attribution: which upstream outcomes have happened this container, and the
             # last real (non-throttle, non-silence) failure with its Groq body.
-            "stt_outcomes": STT_DIAG["counts"], "stt_last_error": STT_DIAG["last_error"]}
+            # STT attribution: outcome counts this container, the last real failure
+            # with its Groq body, and the container/size of the last blob received.
+            "stt_outcomes": STT_DIAG["counts"], "stt_last_error": STT_DIAG["last_error"],
+            "stt_last_blob": STT_DIAG["last_blob"]}
 
 
 # ---------- static ----------

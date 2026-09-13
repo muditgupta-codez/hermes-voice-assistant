@@ -689,7 +689,7 @@ async function startRec() {
     starting = false;
   }
   chunks = [];
-  const preferred = ['audio/webm,codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
+  const preferred = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
   let mime = '';
   for (const m of preferred) { if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) { mime = m; break; } }
   mediaRec = new MediaRecorder(stream, mime ? {mimeType: mime} : undefined);
@@ -830,7 +830,12 @@ function seamlessAnalyser(stream0) {
       bargeAccumMs = 0;
     }
     if (userSpeaking && !speaking) {
-      if (!uttering) { uttering = true; utterStart = now; utterLastVoice = now; chunks = []; utterPeak = 0; }
+      // Keep chunks[0]: it carries the container header (WebM EBML / MP4 ftyp+moov /
+      // Ogg BOS). Wiping every chunk whenever a burst started threw that header away as
+      // soon as the recorder had already emitted its first timeslice — i.e. on EVERY
+      // utterance that followed a pause — handing Groq a headerless remnant, which it
+      // rightly refused as "not a valid media file". Leading silence costs nothing.
+      if (!uttering) { uttering = true; utterStart = now; utterLastVoice = now; if (chunks.length > 1) chunks = chunks.slice(0, 1); utterPeak = 0; }
       utterLastVoice = now;
       vadSilenceMs = 0;
       if (vadLevel > utterPeak) utterPeak = vadLevel;
@@ -869,7 +874,7 @@ function rearmSeamlessRec() {
   setTimeout(()=>{
     if (!seamless || recording) return;
     chunks = [];
-    const preferred = ['audio/webm,codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
+    const preferred = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
     let mime=''; for (const m of preferred){ if (typeof MediaRecorder!=='undefined' && MediaRecorder.isTypeSupported(m)){ mime=m; break; } }
     if (!stream || !stream.getAudioTracks().find(t=>t.readyState==='live')) return;
     mediaRec = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined);
@@ -892,7 +897,7 @@ async function startSeamless() {
   syncSeamlessBtn();
   setMode('SEAMLESS');
   chunks = [];
-  const preferred = ['audio/webm,codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
+  const preferred = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/mp4;codecs=mp4a.40.2','audio/ogg'];
   let mime=''; for (const m of preferred){ if (typeof MediaRecorder!=='undefined' && MediaRecorder.isTypeSupported(m)){ mime=m; break; } }
   mediaRec = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined);
   mediaRec.ondataavailable = e => { if (e.data.size>0) chunks.push(e.data); };
