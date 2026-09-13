@@ -133,6 +133,13 @@ async def stt(file: UploadFile = File(...)):
             files=files,
             data=data_,
         )
+    # Groq's on-demand tier caps whisper at 20 requests/minute. A 429 is a THROTTLE,
+    # not a failure: surface it as 429 + Retry-After so the client can wait and
+    # re-send the SAME audio, instead of rendering a misleading "STT 502" error.
+    if r.status_code == 429:
+        ra = str(r.headers.get("retry-after") or "3")
+        log.warning("groq stt rate limited (retry-after=%ss)", ra)
+        raise HTTPException(429, "STT rate limited", headers={"Retry-After": ra})
     if r.status_code != 200:
         log.error("groq stt failed %s: %s", r.status_code, r.text[:300])
         raise HTTPException(502, f"STT failed: {r.status_code}")

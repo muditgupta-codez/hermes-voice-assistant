@@ -718,7 +718,13 @@ function vadRms(arr) {
   return Math.sqrt(sum / arr.length);
 }
 let utterStart = 0, utterLastVoice = 0;
+let utterPeak = 0;              // loudest RMS seen during the current burst
 let bargeAccumMs = 0;           // how long the louder-than-TTS signal has persisted
+// Room noise, not speech: a SHORT burst that never rose meaningfully above the VAD floor.
+// Transcribing these wastes the 20-req/min Groq budget, and Whisper answers silence with
+// hallucinated text ("Thank you."), so they're dropped locally with no STT call at all.
+const VAD_QUIET_PEAK = 0.026;   // peak RMS below this = never a real word
+const VAD_QUIET_MS = 600;       // ...and shorter than this = not a command
 
 function seamlessAnalyser(stream0) {
   const ctx = new AudioContext();
@@ -764,9 +770,10 @@ function seamlessAnalyser(stream0) {
       bargeAccumMs = 0;
     }
     if (userSpeaking && !speaking) {
-      if (!uttering) { uttering = true; utterStart = now; utterLastVoice = now; chunks = []; }
+      if (!uttering) { uttering = true; utterStart = now; utterLastVoice = now; chunks = []; utterPeak = 0; }
       utterLastVoice = now;
       vadSilenceMs = 0;
+      if (vadLevel > utterPeak) utterPeak = vadLevel;
     } else if (uttering && !speaking) {
       vadSilenceMs = now - utterLastVoice;
       const ripe = (vadSilenceMs >= VAD_END_MS && !muted) || (now - utterStart) > VAD_MAX_MS;
@@ -779,6 +786,12 @@ function seamlessAnalyser(stream0) {
 
 async function commitUtterance() {
   uttering=false;
+  // Noise blip, not a word — skip the STT call entirely (no wasted rate-limit budget).
+  if (utterPeak < VAD_QUIET_PEAK && (utterLastVoice - utterStart) < VAD_QUIET_MS) {
+    utterPeak = 0; vadSilenceMs = 0;
+    return;
+  }
+  utterPeak = 0;
   // latest speech always wins: if the agent is still mid-turn on a prior utterance,
   // cut it off (aborts the in-flight brain/TTS) so two turns never overlap.
   if (isBusy) interrupt();
@@ -867,6 +880,31 @@ muteBtn.addEventListener('touchstart', e=>{ e.preventDefault(); muted = true; ut
 muteBtn.addEventListener('touchend', e=>{ e.preventDefault(); muted = false; syncSeamlessBtn(); }, {passive:false});
 
 
+// Groq's on-demand tier allows only 20 whisper requests/minute. A throttle is NOT a
+// failure: space the calls, and on 429 wait out the Retry-After window and re-send the
+// SAME audio instead of surfacing "ERROR: STT 502" to the user.
+const STT_MIN_GAP_MS = 1500;   // soft spacing so a burst of utterances can't blow the window
+let sttLastAt = 0;
+async function sttGate() {
+  const wait = sttLastAt + STT_MIN_GAP_MS - Date.now();
+  if (wait > 0) await new Promise(r=>setTimeout(r, wait));
+  sttLastAt = Date.now();
+}
+async function transcribe(fd) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await sttGate();
+    const s = await fetch(API + '/stt', {method:'POST', body:fd});
+    if (s.ok) return s;
+    if (s.status === 429 && attempt === 0) {
+      const ra = parseFloat(s.headers.get('Retry-After')) || 3;
+      setMsg('HOLD ON — STILL CATCHING UP…', 'ok');
+      await new Promise(r=>setTimeout(r, Math.min(ra, 6) * 1000 + 400));
+      continue;
+    }
+    return s;
+  }
+  return null;
+}
 async function processAudio(blob) {
   isBusy = true;
   setStatus('TRANSCRIBING…');
@@ -879,7 +917,13 @@ async function processAudio(blob) {
     else if (mime.includes('wav')) ext = 'wav';
     const fd = new FormData();
     fd.append('file', blob, 'audio.' + ext);
-    const s = await fetch(API + '/stt', {method:'POST', body:fd});
+    const s = await transcribe(fd);
+    if (!s) { setMsg('DIDN’T CATCH THAT — TRY AGAIN.'); isBusy=false; setStatus('MIC READY','on'); setMode('VOICE READY'); return; }
+    if (s.status === 429) {
+      // Still throttled after the retry — stay quiet and keep listening (no error bubble).
+      setMsg('ONE SEC — I’M STILL CATCHING UP.');
+      isBusy=false; setStatus('MIC READY','on'); setMode('VOICE READY'); return;
+    }
     if (!s.ok) throw new Error('STT ' + s.status);
     const sj = await s.json();
     const text = sj.text.trim();
