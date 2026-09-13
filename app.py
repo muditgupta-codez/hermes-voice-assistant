@@ -16,7 +16,7 @@ from pathlib import Path
 import httpx
 import edge_tts
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import Response, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -227,6 +227,56 @@ def _runs_url(host: str, port: int) -> str:
     return f"http://{host}:{port}/v1/runs"
 
 
+# ---------- LIVE STREAM (tool calls as they happen) ----------
+# Tool calls used to reach the panel only when the turn finished, attached to the
+# reply bubble as a collapsed chip. Now every tool event is pushed to the browser
+# the moment it happens: the run's event stream is relayed to any connected
+# browser over Server-Sent Events (GET /events), so the panel can paint
+# "tool started" the instant the agent picks up a tool.
+# One asyncio queue per connected browser; a slow/dead client is skipped by the
+# bounded queue rather than ever blocking the agent run.
+_STREAM_SUBS: "set[asyncio.Queue]" = set()
+
+
+def publish(evt: dict) -> None:
+    """Fan a live event out to every connected panel (never blocks, never raises)."""
+    evt = dict(evt)
+    evt.setdefault("ts", time.time())
+    for q in list(_STREAM_SUBS):
+        try:
+            q.put_nowait(evt)
+        except asyncio.QueueFull:
+            pass
+
+
+@app.get("/events")
+async def events():
+    """SSE feed of live agent activity: run.started, tool.started, tool.completed, run.settled."""
+    q: asyncio.Queue = asyncio.Queue(maxsize=500)
+    _STREAM_SUBS.add(q)
+
+    async def gen():
+        try:
+            yield ": stream open\n\n"
+            while True:
+                try:
+                    evt = await asyncio.wait_for(q.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"          # keep-alive through proxies
+                    continue
+                yield "data: " + json.dumps(evt) + "\n\n"
+        except asyncio.CancelledError:
+            raise
+        finally:
+            _STREAM_SUBS.discard(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ---------- TOOL-CALL LOG ----------
 # The panel shows which tools Hermes used for each turn. The api_server streams
 # structured agent lifecycle events on GET /v1/runs/{run_id}/events
@@ -269,17 +319,26 @@ async def _collect_tool_events(host: str, port: str, run_id: str, out: list) -> 
                         continue
                     kind = ev.get("event")
                     if kind == "tool.started":
-                        row = {"tool": ev.get("tool") or "tool",
+                        n = len(out) + 1
+                        row = {"id": f"{run_id}-{n}",
+                               "tool": ev.get("tool") or "tool",
                                "args": (ev.get("preview") or "").strip()[:200],
                                "duration": None, "error": False}
                         out.append(row)
                         open_rows.setdefault(row["tool"], []).append(row)
+                        # paint it in the panel NOW, not when the turn ends
+                        publish({"type": "tool.started", "id": row["id"], "run_id": run_id,
+                                 "tool": row["tool"], "args": row["args"]})
                     elif kind == "tool.completed":
                         name = ev.get("tool") or ""
                         pending = [x for x in open_rows.get(name, []) if x["duration"] is None]
                         if pending:
                             pending[0]["duration"] = ev.get("duration")
                             pending[0]["error"] = bool(ev.get("error"))
+                            publish({"type": "tool.completed", "id": pending[0].get("id"),
+                                     "run_id": run_id, "tool": name,
+                                     "duration": ev.get("duration"),
+                                     "error": bool(ev.get("error"))})
                     elif kind in ("run.completed", "run.failed", "run.cancelled"):
                         break
     except (asyncio.CancelledError, GeneratorExit):
@@ -324,6 +383,8 @@ async def brain(req: BrainRequest):
             log.error("brain start failed %s: %s", r.status_code, r.text[:300])
             raise HTTPException(502, f"Brain start failed: {r.status_code}")
         run_id = r.json().get("run_id")
+        publish({"type": "run.started", "run_id": run_id,
+                 "session_id": session_id, "input": text[:120]})
 
         # Subscribe to the run's event stream NOW (it is dropped when the run
         # settles) so the panel can show which tools the agent used.
@@ -354,16 +415,20 @@ async def brain(req: BrainRequest):
                 except (asyncio.CancelledError, Exception):
                     pass
                 if status != "completed":
+                    publish({"type": "run.settled", "run_id": run_id, "status": status})
                     raise HTTPException(502, f"Brain run {status}: {st.get('error','')}")
                 reply = (st.get("output") or "").strip()
                 if not reply:
                     raise HTTPException(502, "Brain returned empty reply")
                 log.info("BRAIN -> %r (%d tool calls)", reply, len(tool_rows))
+                publish({"type": "run.settled", "run_id": run_id, "status": "completed",
+                         "session_id": session_id})
                 return {"reply": reply, "run_id": run_id, "session_id": session_id,
                         "tools": tool_rows}
             if status == "queued" or status == "running":
                 continue
         events_task.cancel()
+        publish({"type": "run.settled", "run_id": run_id, "status": "timeout"})
         raise HTTPException(504, "Brain run timed out")
 
 
