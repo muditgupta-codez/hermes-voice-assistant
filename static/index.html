@@ -482,6 +482,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
       <div class="listening-line" id="listen"></div>
     </div>
     <div class="dock-controls">
+      <button class="action" id="langBtn" title="Speech language for the mic — pinned, never guessed">LANG: EN</button>
       <select id="voice" class="voice-pick" title="Voice"></select>
       <button class="action" id="autoSpeak" title="Speak the reply aloud">AUTO-SPEAK: ON</button>
       <button class="action" id="seamlessBtn" title="Hands-free: talk without holding the mic, barge-in allowed">SEAMLESS: OFF</button>
@@ -508,6 +509,7 @@ const micBtn = document.getElementById('micBtn');
 const wf = document.getElementById('wf');
 const listenEl = document.getElementById('listen');
 const voicePick = document.getElementById('voice');
+const langBtn = document.getElementById('langBtn');
 const autoSpeakBtn = document.getElementById('autoSpeak');
 const typeInput = document.getElementById('typeInput');
 const sendBtn = document.getElementById('sendBtn');
@@ -791,6 +793,25 @@ function drawWave(levels) {
 // voices — AUTO lets the server match the reply's language (Hindi in, Hindi out)
 VOICES.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; voicePick.appendChild(o); });
 voicePick.value = VOICES.includes(localStorage.getItem('hvoice')) ? localStorage.getItem('hvoice') : AUTO_VOICE;
+
+// speech language — ALWAYS pinned to one of the two, never auto-detected. Auto-detect
+// guesses per clip, and on a short/quiet Hindi clip it guessed wrong and handed back
+// Latin-script gibberish ("Háló, kja hindi kám karríðið?"). Pinned is predictable.
+const LANGS = ['en', 'hi'];
+const LANG_LABEL = { en: 'EN', hi: 'HI' };
+let sttLang = LANGS.includes(localStorage.getItem('hlang')) ? localStorage.getItem('hlang') : 'en';
+function applyLang() {
+  langBtn.textContent = 'LANG: ' + LANG_LABEL[sttLang];
+  langBtn.title = (sttLang === 'hi' ? 'Mic language: Hindi — tap for English'
+                                    : 'Mic language: English — tap for Hindi');
+  langBtn.classList.toggle('active', sttLang === 'hi');
+}
+langBtn.addEventListener('click', ()=>{
+  sttLang = sttLang === 'hi' ? 'en' : 'hi';
+  localStorage.setItem('hlang', sttLang);
+  applyLang();
+});
+applyLang();
 
 // status + mic
 async function initMic() {
@@ -1124,6 +1145,7 @@ async function processAudio(blob) {
     else if (mime.includes('wav')) ext = 'wav';
     const fd = new FormData();
     fd.append('file', blob, 'audio.' + ext);
+    fd.append('language', sttLang);      // pinned EN/HI — see the LANG button
     const s = await transcribe(fd);
     if (!s) { setMsg('DIDN’T CATCH THAT — TRY AGAIN.'); isBusy=false; setStatus('MIC READY','on'); setMode('VOICE READY'); return; }
     if (s.status === 429) {
