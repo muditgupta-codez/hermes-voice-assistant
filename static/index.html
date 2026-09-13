@@ -955,9 +955,12 @@ async function transcribe(fd) {
     await sttGate();
     const s = await fetch(API + '/stt', {method:'POST', body:fd});
     if (s.ok) return s;
-    if (s.status === 429 && attempt === 0) {
-      const ra = parseFloat(s.headers.get('Retry-After')) || 3;
-      setMsg('HOLD ON — STILL CATCHING UP…', 'ok');
+    // 429 = throttle, 5xx = transient upstream blip. Both are worth ONE quiet retry with
+    // the SAME audio; anything else (4xx) is a real answer, so pass it straight through.
+    const transient = s.status >= 500;
+    if ((s.status === 429 || transient) && attempt === 0) {
+      const ra = parseFloat(s.headers.get('Retry-After')) || (transient ? 2 : 3);
+      setMsg(transient ? 'MIC GLITCH — RETRYING…' : 'HOLD ON — STILL CATCHING UP…', 'ok');
       await new Promise(r=>setTimeout(r, Math.min(ra, 6) * 1000 + 400));
       continue;
     }
@@ -984,7 +987,14 @@ async function processAudio(blob) {
       setMsg('ONE SEC — I’M STILL CATCHING UP.');
       isBusy=false; setStatus('MIC READY','on'); setMode('VOICE READY'); return;
     }
-    if (!s.ok) throw new Error('STT ' + s.status);
+    if (!s.ok) {
+      // Never surface a raw status as an error again: the backend now answers 429 (throttle,
+      // handled above) and 503 (transient, retried above). Whatever lands here is unusual, so
+      // say something human and keep the code visible in the mode readout for diagnosis.
+      setMsg('MIC GLITCH — SAY THAT AGAIN.', 'err');
+      setMode('STT ' + s.status);
+      isBusy = false; setStatus('MIC READY','on'); return;
+    }
     const sj = await s.json();
     const text = sj.text.trim();
     if (!text) { setMsg('DIDN’T CATCH THAT — TRY AGAIN.'); isBusy=false; setStatus('MIC READY','on'); setMode('VOICE READY'); return; }

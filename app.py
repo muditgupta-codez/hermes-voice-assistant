@@ -10,7 +10,7 @@ getUserMedia + MediaRecorder (clean audio, echo cancellation built in), then:
 
     mic audio --POST /stt--> text --POST /brain--> reply --GET /tts--> mp3 -> play
 """
-import os, io, json, asyncio, uuid, logging, tempfile
+import os, io, json, time, asyncio, uuid, logging, tempfile
 from pathlib import Path
 
 import httpx
@@ -114,6 +114,26 @@ class BrainRequest(BaseModel):
 
 
 # ---------- STT ----------
+# Upstream (Groq) status -> what the panel should do. The old code mapped EVERY non-200 to
+# HTTPException(502) and the client rendered the status verbatim, so a throttle (429), an
+# undecodable blob (400 — a truncated/odd container from the browser recorder) and a Groq
+# hiccup (5xx) ALL surfaced as the same scary "ERROR: STT 502". Each now gets the treatment
+# it deserves:
+#   429 -> 429 + Retry-After    (throttle: client waits, re-sends the SAME audio)
+#   400 -> 200 {"text": ""}     (nothing to decode = "didn't catch that", not an error)
+#   5xx -> retry once, then 503 + Retry-After (client retries, then stays quiet)
+# Outcome counters + the last non-routine error ride along in /health so a failure can be
+# attributed from outside the container (Coolify only keeps the current container's log).
+STT_DIAG = {"counts": {}, "last_error": None}
+
+
+def _stt_note(outcome, **extra):
+    STT_DIAG["counts"][outcome] = STT_DIAG["counts"].get(outcome, 0) + 1
+    if outcome not in ("ok", "throttled", "silent"):
+        STT_DIAG["last_error"] = {"when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                  "outcome": outcome, **extra}
+
+
 @app.post("/stt")
 async def stt(file: UploadFile = File(...)):
     if not GROQ_KEY:
@@ -124,27 +144,54 @@ async def stt(file: UploadFile = File(...)):
 
     # webm/ogg/mp4 from MediaRecorder — Groq accepts these (language pinned to English).
     ext = Path(file.filename or "audio.webm").suffix or ".webm"
-    async with httpx.AsyncClient(timeout=60) as client:
-        files = {"file": (f"audio{ext}", io.BytesIO(data))}
-        data_ = {"model": GROQ_MODEL, "temperature": "0", "language": "en"}
-        r = await client.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            files=files,
-            data=data_,
-        )
-    # Groq's on-demand tier caps whisper at 20 requests/minute. A 429 is a THROTTLE,
-    # not a failure: surface it as 429 + Retry-After so the client can wait and
-    # re-send the SAME audio, instead of rendering a misleading "STT 502" error.
-    if r.status_code == 429:
-        ra = str(r.headers.get("retry-after") or "3")
-        log.warning("groq stt rate limited (retry-after=%ss)", ra)
-        raise HTTPException(429, "STT rate limited", headers={"Retry-After": ra})
-    if r.status_code != 200:
-        log.error("groq stt failed %s: %s", r.status_code, r.text[:300])
-        raise HTTPException(502, f"STT failed: {r.status_code}")
-    text = r.json().get("text", "").strip()
+    last = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                last = await client.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                    files={"file": (f"audio{ext}", io.BytesIO(data))},
+                    data={"model": GROQ_MODEL, "temperature": "0", "language": "en"},
+                )
+        except Exception as e:                      # network hiccup / timeout
+            last = None
+            if attempt == 0:
+                await asyncio.sleep(0.4)
+                continue
+            log.error("groq stt unreachable: %s", str(e)[:200])
+            _stt_note("network_error", detail=str(e)[:200], bytes=len(data))
+            raise HTTPException(503, "STT upstream unreachable", headers={"Retry-After": "2"})
+
+        if 200 <= last.status_code < 300:
+            break
+        if last.status_code == 429:
+            ra = str(last.headers.get("retry-after") or "3")
+            log.warning("groq stt rate limited (retry-after=%ss)", ra)
+            _stt_note("throttled")
+            raise HTTPException(429, "STT rate limited", headers={"Retry-After": ra})
+        if last.status_code == 400:
+            # Groq could not decode the blob at all — a truncated/odd container from the
+            # recorder, not a user-facing failure. Behave exactly like silence.
+            log.warning("groq stt undecodable (400): %s", last.text[:200])
+            _stt_note("silent", detail=last.text[:200], bytes=len(data))
+            return {"text": "", "reason": "undecodable", "bytes": len(data)}
+        if attempt == 0:                            # transient upstream blip: one retry
+            log.warning("groq stt %s — retrying once", last.status_code)
+            await asyncio.sleep(0.4)
+            continue
+        break
+
+    if last is None or not (200 <= last.status_code < 300):
+        code = getattr(last, "status_code", "n/a")
+        body = last.text[:300] if last is not None else "no response"
+        log.error("groq stt failed %s: %s", code, body)
+        _stt_note("upstream_%s" % code, detail=body, bytes=len(data))
+        raise HTTPException(503, f"STT upstream error {code}", headers={"Retry-After": "2"})
+
+    text = last.json().get("text", "").strip()
     log.info("STT -> %r", text)
+    _stt_note("ok")
     return {"text": text}
 
 
@@ -414,13 +461,19 @@ async def health():
     except Exception as e:
         probe = {"host": BRAIN_HOST, "port": BRAIN_PORT, "err": str(e)[:120]}
     return {"ok": True, "stt": bool(GROQ_KEY), "brain": brain_ok,
-            "tts": bool(TTS_VOICE), "brain_url": BRAIN_URL, "probe": probe}
+            "tts": bool(TTS_VOICE), "brain_url": BRAIN_URL, "probe": probe,
+            # STT attribution: which upstream outcomes have happened this container, and the
+            # last real (non-throttle, non-silence) failure with its Groq body.
+            "stt_outcomes": STT_DIAG["counts"], "stt_last_error": STT_DIAG["last_error"]}
 
 
 # ---------- static ----------
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    # The client code must never go stale: a cached page from an older deploy is exactly how
+    # a bug already fixed in the backend (the "STT 502" mapping) keeps showing up in the UI.
+    return FileResponse(STATIC_DIR / "index.html",
+                        headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"})
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
