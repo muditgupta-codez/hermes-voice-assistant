@@ -606,7 +606,8 @@ function interrupt() {
   isBusy = false;
 }
 
-const VOICES = ['en-US-AriaNeural','en-US-JennyNeural','en-US-GuyNeural','en-GB-RyanNeural','en-GB-SoniaNeural','en-IN-NeerjaNeural','en-IN-PrabhatNeural','hi-IN-SwaraNeural'];
+const AUTO_VOICE = 'AUTO (match my language)';
+const VOICES = [AUTO_VOICE,'en-US-AriaNeural','en-US-JennyNeural','en-US-GuyNeural','en-GB-RyanNeural','en-GB-SoniaNeural','en-IN-NeerjaNeural','en-IN-PrabhatNeural','hi-IN-SwaraNeural','hi-IN-MadhurNeural'];
 
 function clearEmptyHint() {
   const eh = conv.querySelector('.empty-hint');
@@ -787,9 +788,9 @@ function drawWave(levels) {
   }
 }
 
-// voices
+// voices — AUTO lets the server match the reply's language (Hindi in, Hindi out)
 VOICES.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; voicePick.appendChild(o); });
-voicePick.value = 'en-US-AriaNeural';
+voicePick.value = VOICES.includes(localStorage.getItem('hvoice')) ? localStorage.getItem('hvoice') : AUTO_VOICE;
 
 // status + mic
 async function initMic() {
@@ -1182,7 +1183,7 @@ async function speak(text) {
   speaking = true;
   currentAbort = currentAbort || new AbortController();
   try {
-    const r = await fetch(API + '/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: currentSessionId}), signal: currentAbort.signal});
+    const r = await fetch(API + '/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: currentSessionId, voice: voicePick.value === AUTO_VOICE ? '' : voicePick.value}), signal: currentAbort.signal});
     if (!r.ok) throw new Error('TTS ' + r.status);
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
@@ -1198,7 +1199,7 @@ async function speak(text) {
 }
 
 autoSpeakBtn.addEventListener('click', ()=>{ autoSpeak=!autoSpeak; autoSpeakBtn.textContent = 'AUTO-SPEAK: ' + (autoSpeak?'ON':'OFF'); autoSpeakBtn.classList.toggle('active', autoSpeak); });
-voicePick.addEventListener('change', ()=>{ /* toggle server uses default; could pass voice via /tts */ });
+voicePick.addEventListener('change', ()=>{ localStorage.setItem('hvoice', voicePick.value); });
 
 // keyboard: space to talk while focus elsewhere
 document.addEventListener('keydown', async e=>{

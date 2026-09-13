@@ -10,12 +10,12 @@ getUserMedia + MediaRecorder (clean audio, echo cancellation built in), then:
 
     mic audio --POST /stt--> text --POST /brain--> reply --GET /tts--> mp3 -> play
 """
-import os, io, json, time, asyncio, uuid, logging, tempfile
+import os, io, re, json, time, asyncio, uuid, logging, tempfile
 from pathlib import Path
 
 import httpx
 import edge_tts
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import Response, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -83,6 +83,20 @@ async def find_brain_host() -> tuple[str, str, int]:
     return BRAIN_HOST, BRAIN_PORT, -1
 
 TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-AriaNeural")
+TTS_VOICE_HI = os.environ.get("TTS_VOICE_HI", "hi-IN-SwaraNeural")
+
+# Whisper auto-detects the spoken language only when we DON'T pin one. Pinning
+# "en" is what mangled Hindi into English-sounding nonsense, so the default is now
+# auto-detect; STT_LANGUAGE (env) or a per-request `language` form field can pin it.
+STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "")
+_DEVANAGARI = re.compile(r"[\u0900-\u097F]")
+
+
+def pick_tts_voice(text: str, asked: str | None = None) -> str:
+    """Voice for this reply: explicit request > Devanagari in the text > English default."""
+    if asked and asked.strip().lower() not in ("", "auto", "default"):
+        return asked.strip()
+    return TTS_VOICE_HI if _DEVANAGARI.search(text or "") else TTS_VOICE
 
 # System prompt / persona for the assistant.
 SYSTEM_PROMPT = os.environ.get(
@@ -90,7 +104,8 @@ SYSTEM_PROMPT = os.environ.get(
     "You are Mudit's personal Hermes voice assistant, speaking out loud. "
     "Keep replies short, conversational, and natural — 1-3 sentences. "
     "Do not use markdown, bullets, or emojis. Answer as if speaking. "
-    "Always respond in English, even if the user speaks another language.",
+    "Reply in the language the user spoke to you in: Hindi in, Hindi out; English in, "
+    "English out. Match their mix if they mix the two, and write Hindi in Devanagari.",
 )
 
 DEFAULT_USER = os.environ.get("DEFAULT_USER", "there")
@@ -111,6 +126,7 @@ audio_files.mkdir(exist_ok=True)
 class BrainRequest(BaseModel):
     text: str
     session_id: str | None = None
+    voice: str | None = None      # /tts only: empty/"auto" = pick by the reply's script
 
 
 # ---------- STT ----------
@@ -153,7 +169,7 @@ def _stt_note(outcome, **extra):
 
 
 @app.post("/stt")
-async def stt(file: UploadFile = File(...)):
+async def stt(file: UploadFile = File(...), language: str | None = Form(None)):
     if not GROQ_KEY:
         raise HTTPException(500, "GROQ_API_KEY not configured")
     data = await file.read()
@@ -165,7 +181,12 @@ async def stt(file: UploadFile = File(...)):
                              "container": _sniff_container(data), "head": data[:12].hex(),
                              "bytes": len(data), "name": file.filename or ""}
 
-    # webm/ogg/mp4 from MediaRecorder — Groq accepts these (language pinned to English).
+    # webm/ogg/mp4 from MediaRecorder — Groq accepts these. Language is auto-detected
+    # unless STT_LANGUAGE / the `language` form field pins it (auto = Hindi works too).
+    form = {"model": GROQ_MODEL, "temperature": "0"}
+    _lang = (language or STT_LANGUAGE or "").strip()
+    if _lang:
+        form["language"] = _lang
     ext = Path(file.filename or "audio.webm").suffix or ".webm"
     last = None
     for attempt in range(2):
@@ -175,7 +196,7 @@ async def stt(file: UploadFile = File(...)):
                     GROQ_URL,
                     headers={"Authorization": f"Bearer {GROQ_KEY}"},
                     files={"file": (f"audio{ext}", io.BytesIO(data))},
-                    data={"model": GROQ_MODEL, "temperature": "0", "language": "en"},
+                    data=form,
                 )
         except Exception as e:                      # network hiccup / timeout
             last = None
@@ -439,10 +460,11 @@ async def tts(req: BrainRequest):
     text = req.text.strip()
     if not text:
         raise HTTPException(400, "empty text")
+    voice = pick_tts_voice(text, req.voice)
     mp3_path = TMP_DIR / f"tts_{uuid.uuid4().hex}.mp3"
 
     async def _do():
-        c = edge_tts.Communicate(text, voice=TTS_VOICE)
+        c = edge_tts.Communicate(text, voice=voice)
         await c.save(str(mp3_path))
 
     try:
@@ -452,7 +474,8 @@ async def tts(req: BrainRequest):
         raise HTTPException(502, f"TTS failed: {e}")
     data = mp3_path.read_bytes()
     mp3_path.unlink(missing_ok=True)
-    return Response(content=data, media_type="audio/mpeg")
+    return Response(content=data, media_type="audio/mpeg",
+                    headers={"X-TTS-Voice": voice})
 
 
 # ---------- SESSION MANAGEMENT (proxy to the Hermes api_server) ----------
@@ -551,6 +574,9 @@ async def health():
         probe = {"host": BRAIN_HOST, "port": BRAIN_PORT, "err": str(e)[:120]}
     return {"ok": True, "stt": bool(GROQ_KEY), "brain": brain_ok,
             "tts": bool(TTS_VOICE), "brain_url": BRAIN_URL, "probe": probe,
+            # language plumbing, so the deployed panel can be checked without guessing
+            "stt_language": STT_LANGUAGE or "auto", "tts_voice": TTS_VOICE,
+            "tts_voice_hi": TTS_VOICE_HI,
             # STT attribution: which upstream outcomes have happened this container, and the
             # last real (non-throttle, non-silence) failure with its Groq body.
             # STT attribution: outcome counts this container, the last real failure
