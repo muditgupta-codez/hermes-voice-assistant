@@ -158,6 +158,18 @@ main {
 .bubble.ai { align-self: flex-start; background: var(--panel2); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
 .bubble .who { font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: 1.6px; color: var(--ink-dim); margin-bottom: 4px; }
 .bubble.ai .who { color: var(--accent2); }
+/* tool-call log — collapsed chip under a HERMES bubble, expands to the calls */
+.tool-log { margin-top: 9px; border-top: 1px dashed var(--line); padding-top: 7px; }
+.tool-log > summary { font-family: var(--mono); font-size: 9.5px; letter-spacing: 1.3px; text-transform: uppercase; color: var(--ink-dim); cursor: pointer; user-select: none; list-style: none; }
+.tool-log > summary::-webkit-details-marker { display: none; }
+.tool-log > summary::before { content: '▸ '; }
+.tool-log[open] > summary::before { content: '▾ '; }
+.tool-log > summary:hover { color: var(--accent); }
+.tl-row { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-dim); padding: 3px 0 3px 10px; margin-top: 5px; border-left: 2px solid rgba(57,216,224,.35); word-break: break-word; }
+.tl-row.err { border-left-color: #ff6b81; color: #ffb3bd; }
+.tl-name { color: var(--accent2); }
+.tl-meta { opacity: .75; }
+.tl-out { display: block; opacity: .7; margin-top: 2px; }
 
 /* session panel */
 .session-wrap { flex-shrink: 0; }
@@ -550,11 +562,59 @@ function clearEmptyHint() {
   if (eh) eh.remove();
 }
 
-function addBubble(text, who) {
+function attachToolLog(bubbleEl, tools) {
+  if (!bubbleEl || !tools || !tools.length) return;
+  bubbleEl.insertAdjacentHTML('beforeend', toolLogHtml(tools));
+}
+function toolLogHtml(tools) {
+  if (!tools || !tools.length) return '';
+  const rows = tools.map(t => {
+    const err = t.error ? ' err' : '';
+    const dur = (t.duration != null && t.duration !== '') ? ` <span class="tl-meta">${escapeHtml(Number(t.duration).toFixed(2))}s</span>` : '';
+    const out = t.result ? `<span class="tl-out">↳ ${escapeHtml(String(t.result).slice(0,200))}</span>` : '';
+    return `<div class="tl-row${err}"><span class="tl-name">${escapeHtml(t.tool || 'tool')}</span> ${escapeHtml(t.args || '')}${dur}${out}</div>`;
+  }).join('');
+  const n = tools.length;
+  const failed = tools.filter(t => t.error).length;
+  return `<details class="tool-log"><summary>${n} tool call${n===1?'':'s'}${failed?' · '+failed+' failed':''}</summary>${rows}</details>`;
+}
+// Did a stored tool result represent a failure? Parse the JSON result when we
+// can (deterministic: null error + exit_code 0 = success), else regex the rest.
+function resultFailed(raw) {
+  if (!raw) return false;
+  try {
+    const d = JSON.parse(raw);
+    if (d && typeof d === 'object') {
+      if (d.error !== undefined && d.error !== null && d.error !== '' && d.error !== false) return true;
+      if (typeof d.exit_code === 'number' && d.exit_code !== 0) return true;
+      if (d.success === false || d.ok === false) return true;
+      return false;
+    }
+  } catch(e) { /* not JSON — fall through */ }
+  return /"(is_)?error"\s*:\s*true/.test(raw);
+}
+// Turn a stored tool_calls entry into a log row (for reloaded history).
+function rowFromCall(tc) {
+  const fn = (tc && (tc.function || tc)) || {};
+  return { tool: fn.name || 'tool', args: argsPreview(fn.arguments), duration: null, error: false,
+           call_id: tc.call_id || tc.id || null, result: '' };
+}
+function argsPreview(raw) {
+  if (raw == null) return '';
+  let d = raw;
+  if (typeof raw === 'string') { try { d = JSON.parse(raw); } catch(e) { return raw.slice(0, 160); } }
+  if (!d || typeof d !== 'object') return String(d).slice(0, 160);
+  for (const k of ['command','cmd','query','url','path','file_path','prompt','text','name']) {
+    if (typeof d[k] === 'string' || typeof d[k] === 'number') return (k + ': ' + d[k]).slice(0, 160);
+  }
+  return Object.keys(d).slice(0, 4).map(k => k + '=' + String(d[k]).slice(0, 40)).join(', ').slice(0, 160);
+}
+function addBubble(text, who, tools) {
   clearEmptyHint();
   const b = document.createElement('div');
   b.className = 'bubble ' + who;
   b.innerHTML = `<div class="who">${who==='user'?'COMMAND':'HERMES'}</div><div>${text}</div>`;
+  attachToolLog(b, tools);
   conv.appendChild(b);
   conv.scrollTop = conv.scrollHeight;
   return b;
@@ -947,7 +1007,7 @@ async function doBrain(text) {
     if (!r.ok) throw new Error('Brain ' + r.status);
     const rj = await r.json();
     const reply = (rj.reply || '').trim();
-    addBubble(reply, 'ai');
+    addBubble(reply, 'ai', rj.tools);
     if (autoSpeak) await speak(reply);
   } catch(e) {
     if (e.name !== 'AbortError') setMsg('ERROR: ' + e.message, 'err');
@@ -1093,16 +1153,42 @@ async function resumeSession(s) {
     if (!r.ok) throw new Error('msgs ' + r.status);
     const j = await r.json();
     const arr = (j.data || []);
+    // Rebuild the tool-call log for reloaded history: assistant messages carry
+    // tool_calls, the following role="tool" messages carry their results.
+    const rows = [];
+    let lastAi = null;
     let shown = 0;
     for (const m of arr) {
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        for (const tc of m.tool_calls) rows.push(rowFromCall(tc));
+        continue;
+      }
+      if (m.role === 'tool') {
+        const callId = m.tool_call_id;
+        let row = callId ? rows.find(r => r.call_id && r.call_id === callId) : null;
+        if (!row) row = rows.filter(r => !r.result).pop();
+        if (row) {
+          const raw = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+          row.result = raw;
+          row.error = resultFailed(raw);
+        }
+        continue;
+      }
       const role = m.role;
       if (role !== 'user' && role !== 'assistant') continue;
       let text = m.content;
       if (Array.isArray(text)) text = text.map(p=> p && p.text ? p.text : '').join(' ');
       if (!text || !text.trim()) continue;
-      addBubble(text.trim(), role==='user'?'user':'ai');
+      if (role === 'assistant') {
+        lastAi = addBubble(text.trim(), 'ai', rows.slice());
+        rows.length = 0;
+      } else {
+        addBubble(text.trim(), 'user');
+      }
       shown++;
     }
+    // tool calls with no following assistant text (run cut short) still get a log
+    if (rows.length && lastAi) attachToolLog(lastAi, rows.slice());
     if (!shown) addBubble('(EMPTY SESSION)','ai');
   } catch(e){ setMsg('FAILED TO LOAD HISTORY', 'err'); }
   await loadSessions();

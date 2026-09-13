@@ -10,7 +10,7 @@ getUserMedia + MediaRecorder (clean audio, echo cancellation built in), then:
 
     mic audio --POST /stt--> text --POST /brain--> reply --GET /tts--> mp3 -> play
 """
-import os, io, asyncio, uuid, logging, tempfile
+import os, io, json, asyncio, uuid, logging, tempfile
 from pathlib import Path
 
 import httpx
@@ -156,6 +156,67 @@ def _runs_url(host: str, port: int) -> str:
     return f"http://{host}:{port}/v1/runs"
 
 
+# ---------- TOOL-CALL LOG ----------
+# The panel shows which tools Hermes used for each turn. The api_server streams
+# structured agent lifecycle events on GET /v1/runs/{run_id}/events
+# (tool.started carries the tool name + an args preview, tool.completed carries
+# duration/error). That stream only exists while the run lives — it is closed and
+# dropped the moment the run settles — so we subscribe immediately after starting
+# the run and buffer the rows while we poll for completion. Fetching events after
+# the run finished returns nothing.
+def _args_preview(raw: str) -> str:
+    """Compress a tool's JSON arguments into one short human-readable line."""
+    try:
+        d = json.loads(raw or "{}")
+    except Exception:
+        return (raw or "")[:160]
+    if not isinstance(d, dict):
+        return str(d)[:160]
+    for k in ("command", "cmd", "query", "url", "path", "file_path", "prompt", "text", "name"):
+        if k in d and isinstance(d[k], (str, int, float)):
+            return f"{k}: {str(d[k])}"[:160]
+    return ", ".join(f"{k}={str(v)[:40]}" for k, v in list(d.items())[:4])[:160]
+
+
+async def _collect_tool_events(host: str, port: str, run_id: str, out: list) -> None:
+    """Stream a run's lifecycle events; append one row per tool call to `out`."""
+    url = f"http://{host}:{port}/v1/runs/{run_id}/events"
+    headers = {"Authorization": f"Bearer {BRAIN_KEY}"}
+    open_rows: dict[str, list] = {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as client:
+            async with client.stream("GET", url, headers=headers) as r:
+                if r.status_code != 200:
+                    log.warning("tool-event stream HTTP %s for run %s", r.status_code, run_id)
+                    return
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        ev = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+                    kind = ev.get("event")
+                    if kind == "tool.started":
+                        row = {"tool": ev.get("tool") or "tool",
+                               "args": (ev.get("preview") or "").strip()[:200],
+                               "duration": None, "error": False}
+                        out.append(row)
+                        open_rows.setdefault(row["tool"], []).append(row)
+                    elif kind == "tool.completed":
+                        name = ev.get("tool") or ""
+                        pending = [x for x in open_rows.get(name, []) if x["duration"] is None]
+                        if pending:
+                            pending[0]["duration"] = ev.get("duration")
+                            pending[0]["error"] = bool(ev.get("error"))
+                    elif kind in ("run.completed", "run.failed", "run.cancelled"):
+                        break
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except Exception as e:
+        log.info("tool-event stream ended for run %s: %s", run_id, e)
+
+
 @app.post("/brain")
 async def brain(req: BrainRequest):
     if not BRAIN_KEY:
@@ -193,6 +254,13 @@ async def brain(req: BrainRequest):
             raise HTTPException(502, f"Brain start failed: {r.status_code}")
         run_id = r.json().get("run_id")
 
+        # Subscribe to the run's event stream NOW (it is dropped when the run
+        # settles) so the panel can show which tools the agent used.
+        tool_rows: list = []
+        events_task = asyncio.create_task(
+            _collect_tool_events(host, port, run_id, tool_rows)
+        )
+
         # Poll GET /v1/runs/{run_id} until the run settles.
         status_url = url + "/" + run_id
         for _ in range(60):
@@ -206,15 +274,25 @@ async def brain(req: BrainRequest):
             st = pr.json()
             status = st.get("status")
             if status in ("completed", "failed", "interrupted", "cancelled"):
+                # brief grace so the last tool.completed frames land before we
+                # cut the stream
+                await asyncio.sleep(0.4)
+                events_task.cancel()
+                try:
+                    await events_task
+                except (asyncio.CancelledError, Exception):
+                    pass
                 if status != "completed":
                     raise HTTPException(502, f"Brain run {status}: {st.get('error','')}")
                 reply = (st.get("output") or "").strip()
                 if not reply:
                     raise HTTPException(502, "Brain returned empty reply")
-                log.info("BRAIN -> %r", reply)
-                return {"reply": reply, "run_id": run_id, "session_id": session_id}
+                log.info("BRAIN -> %r (%d tool calls)", reply, len(tool_rows))
+                return {"reply": reply, "run_id": run_id, "session_id": session_id,
+                        "tools": tool_rows}
             if status == "queued" or status == "running":
                 continue
+        events_task.cancel()
         raise HTTPException(504, "Brain run timed out")
 
 
