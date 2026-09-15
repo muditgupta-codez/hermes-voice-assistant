@@ -632,11 +632,20 @@ function interrupt() {
 }
 
 const AUTO_VOICE = 'AUTO (match my language)';
-// Sarvam bulbul:v3 speakers — the natural Indian voices. edge-tts stays listed as a
-// fallback/lower-latency option; a "sarvam:" pick routes the reply through Sarvam.
-const SARVAM_VOICES = ['sarvam:ishita','sarvam:neha','sarvam:kavya','sarvam:priya','sarvam:ritu','sarvam:simran','sarvam:pooja','sarvam:roopa','sarvam:shruti','sarvam:tanya','sarvam:aditya','sarvam:rahul','sarvam:rohan','sarvam:amit','sarvam:dev','sarvam:ashutosh','sarvam:ratan','sarvam:varun','sarvam:manan','sarvam:shubh'];
-const EDGE_VOICES = ['en-US-AriaNeural','en-US-JennyNeural','en-US-GuyNeural','en-GB-RyanNeural','en-GB-SoniaNeural','en-IN-NeerjaNeural','en-IN-PrabhatNeural','hi-IN-SwaraNeural','hi-IN-MadhurNeural'];
-const VOICES = [AUTO_VOICE, ...SARVAM_VOICES, ...EDGE_VOICES];
+// Voices are grouped and labelled by gender because the reply's Hindi grammar follows the
+// voice — a female voice saying "सुन रहा हूँ" is audible and wrong. The server keeps the
+// same female/male split keyed on the voice name (app.py FEMALE_VOICES), so keep in step.
+const SARVAM_F = ['ishita','priya','suhani','neha','roopa','ritu','pooja','kavya','shreya','shruti','simran','tanya','kavitha','rupali','dev'];
+const SARVAM_M = ['shubh','ratan','ashutosh','rehan','rohan','mani','varun','aditya','rahul','amit','manan','sumit','kabir','aayan','advait','anand','tarun','sunny','gokul','vijay','mohit','soham'];
+const EDGE_F = ['en-IN-NeerjaExpressiveNeural','en-IN-NeerjaNeural','en-US-AriaNeural','en-US-JennyNeural','en-GB-SoniaNeural','hi-IN-SwaraNeural'];
+const EDGE_M = ['en-IN-PrabhatNeural','en-US-GuyNeural','en-GB-RyanNeural','hi-IN-MadhurNeural'];
+const VOICE_GROUPS = [
+  ['Sarvam · female (natural Hindi)', SARVAM_F.map(s => ['sarvam:'+s, s])],
+  ['Sarvam · male',                   SARVAM_M.map(s => ['sarvam:'+s, s])],
+  ['edge-tts · female (faster, flatter)', EDGE_F.map(v => [v, v])],
+  ['edge-tts · male',                 EDGE_M.map(v => [v, v])],
+];
+const VOICES = [AUTO_VOICE, ...SARVAM_F.map(s=>'sarvam:'+s), ...SARVAM_M.map(s=>'sarvam:'+s), ...EDGE_F, ...EDGE_M];
 
 function clearEmptyHint() {
   const eh = conv.querySelector('.empty-hint');
@@ -757,7 +766,16 @@ function streamFinish(ev) {
   streamScroll();
 }
 function streamHandle(ev) {
-  if (ev.type === 'run.started') { streamReset(); streamStateSet('live', 'live'); }
+  if (ev.type === 'run.started') {
+    // Bind the open turn to this run. The event stream can finish a turn on its own,
+    // which is what keeps a long tool run from dying as "ERROR: Brain 504" when the
+    // /brain wait gives up before the agent does.
+    if (ev.run_id) {
+      const t = openTurns.find(x => !x.runId && x.text && ev.input && x.text === ev.input);
+      if (t) { t.runId = ev.run_id; startRunPoll(t); }
+    }
+    streamReset(); streamStateSet('live', 'live');
+  }
   else if (ev.type === 'tool.started') { streamStateSet('live', 'live'); streamAdd(ev); }
   else if (ev.type === 'tool.completed') { streamFinish(ev); }
   else if (ev.type === 'run.settled') {
@@ -768,6 +786,10 @@ function streamHandle(ev) {
     }
     const ok = ev.status === 'completed';
     streamStateSet(ok ? 'done' : String(ev.status || 'ended'), ok ? '' : 'err');
+    // and land the answer, whichever path reached us first (this event carries the
+    // reply too — see app.py's publish of run.settled)
+    const t = ev.run_id ? openTurns.find(x => x.runId === ev.run_id) : null;
+    if (t) { if (ok) finishTurn(t, (ev.reply || '').trim()); else failTurn(t, ev.status, ev.error); }
   }
 }
 function connectStream() {
@@ -1362,29 +1384,106 @@ async function processAudio(blob) {
   }
 }
 
+/* ---------- turn registry (the long-run safety net) ----------
+   /brain holds its HTTP response open until the agent's run settles, so a long tool
+   run used to end in "ERROR: Brain 504" MID-RUN — the panel gave up while the agent
+   was still working. A turn is no longer owned by its fetch. Every turn is registered,
+   bound to its run id from the run.started event, and finished EXACTLY ONCE by whichever
+   arrives first: the /brain response, the run.settled event (which now carries the
+   reply), or the /brain/{run_id} poll. Nothing here shows a timeout mid-run — a wait
+   that dies simply hands the turn to the two paths that don't depend on it. */
+let turnSeq = 0;
+const openTurns = [];                     // turns whose reply has not been rendered yet
+function turnDrop(turn) { const i = openTurns.indexOf(turn); if (i >= 0) openTurns.splice(i, 1); }
+function turnIdle() {
+  clearThinking();
+  isBusy = false;
+  sendBtn.disabled = false;      // a turn finished by the stream/poll must free the input
+  setStatus('MIC READY', 'on');
+  setMode('STANDBY');
+}
+
+async function finishTurn(turn, reply) {
+  if (!turn || turn.done) return;
+  turn.done = true;
+  if (turn.poll) { clearInterval(turn.poll); turn.poll = null; }
+  const wasNewest = openTurns[openTurns.length - 1] === turn;
+  turnDrop(turn);
+  if (reply) {
+    addBubble(reply, 'ai');
+    if (autoSpeak && wasNewest) await speak(reply);
+  } else if (!openTurns.length) {
+    setMsg('THE RUN ENDED WITHOUT AN ANSWER.', 'err');
+  }
+  if (!openTurns.length) turnIdle();
+}
+
+function failTurn(turn, status, err) {
+  if (!turn || turn.done) return;
+  turn.done = true;
+  if (turn.poll) { clearInterval(turn.poll); turn.poll = null; }
+  const wasNewest = openTurns[openTurns.length - 1] === turn;
+  turnDrop(turn);
+  if (wasNewest) {
+    setMsg(('RUN ' + String(status || 'ENDED').toUpperCase() + (err ? ' — ' + err : '')).slice(0, 180), 'err');
+    turnIdle();
+  }
+}
+
+// Belt and braces: if the event stream missed the settle (a reconnect drops events),
+// one cheap GET per few seconds still finds the answer.
+function startRunPoll(turn) {
+  if (!turn.runId || turn.poll) return;
+  let tries = 0;
+  turn.poll = setInterval(async () => {
+    if (turn.done || ++tries > 900) { clearInterval(turn.poll); turn.poll = null; return; }
+    try {
+      const r = await fetch(API + '/brain/' + encodeURIComponent(turn.runId));
+      if (!r.ok) return;
+      const j = await r.json();
+      if (j.status === 'completed') await finishTurn(turn, (j.reply || '').trim());
+      else if (j.status && j.status !== 'running' && j.status !== 'queued') failTurn(turn, j.status, j.error);
+    } catch(e) { /* a blip must never kill the turn */ }
+  }, 4000);
+}
+
 async function doBrain(text) {
   setThinking();
   setMode('PROCESSING');
   // fresh turn — the stream shows THIS turn's tool calls, from the first event
   streamReset();
   streamStateSet('live', 'live');
+  const turn = { id: ++turnSeq, text: String(text || '').slice(0, 120),
+                 runId: null, done: false, poll: null };
+  openTurns.push(turn);
   currentAbort = new AbortController();
   try {
-    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: currentSessionId}), signal: currentAbort.signal});
+    // The voice goes to the brain too, not just to /tts: Hindi first-person verb forms
+    // are gendered, so the reply has to be written for the voice that will speak it.
+    const r = await fetch(API + '/brain', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, session_id: currentSessionId, voice: voicePick.value === AUTO_VOICE ? '' : voicePick.value}), signal: currentAbort.signal});
     if (!r.ok) throw new Error('Brain ' + r.status);
     const rj = await r.json();
-    const reply = (rj.reply || '').trim();
+    turn.runId = turn.runId || rj.run_id;
     // no tool chip on the bubble any more: the calls were streamed live above,
     // as they happened (see the tool stream / GET /events)
-    addBubble(reply, 'ai');
-    if (autoSpeak) await speak(reply);
+    await finishTurn(turn, (rj.reply || '').trim());
+    return;
   } catch(e) {
-    if (e.name !== 'AbortError') setMsg('ERROR: ' + e.message, 'err');
+    if (e.name === 'AbortError') {
+      // barge-in: the run keeps going upstream and its answer still lands here
+    } else if (turn.runId && !turn.done) {
+      // The run is alive (we saw it start) — the WAIT died, not the work. Keep listening.
+      clearThinking();
+      isBusy = false; setStatus('MIC READY', 'on');
+      setMode('WORKING');
+      setMsg('LONG RUN — STILL WORKING. THE ANSWER LANDS HERE WHEN IT’S DONE.', 'ok');
+      startRunPoll(turn);
+      return;
+    } else if (!turn.done) {
+      setMsg('ERROR: ' + e.message, 'err');
+    }
   }
-  clearThinking();
-  isBusy = false;
-  setStatus('MIC READY', 'on');
-  setMode('STANDBY');
+  if (openTurns[openTurns.length - 1] === turn) turnIdle();
 }
 
 async function speak(text) {

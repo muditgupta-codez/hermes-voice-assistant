@@ -30,6 +30,14 @@ BRAIN_HOST = os.environ.get("API_SERVER_HOST", "127.0.0.1")
 BRAIN_PORT = os.environ.get("API_SERVER_PORT", "8642")
 BRAIN_URL = f"http://{BRAIN_HOST}:{BRAIN_PORT}/v1/chat/completions"
 BRAIN_MODEL = os.environ.get("BRAIN_MODEL", "hermes-agent")
+# How long /brain will hold the HTTP wait open for a run to settle. Tool runs that
+# build, browse, or dispatch real work routinely outlive two minutes; the old cap was
+# 60 polls x 2s = 120s, so a long run surfaced in the panel as "ERROR: Brain 504"
+# while the agent was still working. The panel no longer depends on this wait (the
+# run.settled event carries the reply, and /brain/{run_id} is pollable), so this is
+# only a backstop for a genuinely stuck run.
+BRAIN_RUN_TIMEOUT_S = float(os.environ.get("BRAIN_RUN_TIMEOUT_S", "1800"))
+BRAIN_POLL_S = float(os.environ.get("BRAIN_POLL_S", "1.5"))
 
 # Candidate hosts to try when reaching the brain on the docker 'coolify' network.
 # Order: explicit env host first (if set to something other than default), then
@@ -126,6 +134,53 @@ def is_real_edge_voice(voice: str) -> bool:
     """edge-tts voices are '<lang>-<REGION>-<Name>Neural'; 'sarvam:x' is not one."""
     return bool(voice) and not sarvam_speaker_of(voice) and voice.endswith("Neural")
 
+
+# Hindi first-person verbs are gendered — "मैं सुन रहा हूँ" vs "मैं सुन रही हूँ" — and the
+# assistant must agree with the voice it is speaking through. A female voice reading a
+# masculine line is audible and wrong.
+#
+# These tables are MEASURED, not inferred from names: every bulbul:v3 speaker was
+# synthesized on three different lines and its median F0 taken with two independent
+# estimators (autocorrelation + harmonic product spectrum). Adult female speech centres
+# ~180-270 Hz, adult male ~90-165 Hz. The two speakers landing in the 165-180 Hz overlap
+# (neha, rohan) were resolved from Sarvam's published gender list instead of the number.
+# Note `dev` measures female (≈205 Hz) despite the name — the audio is the authority.
+SARVAM_FEMALE = {"ishita", "priya", "suhani", "neha", "roopa", "ritu", "pooja",
+                 "kavya", "shreya", "shruti", "simran", "tanya", "kavitha", "rupali", "dev"}
+SARVAM_MALE = {"shubh", "ratan", "ashutosh", "rehan", "rohan", "mani", "varun",
+               "aditya", "rahul", "amit", "manan", "sumit", "kabir", "aayan", "advait",
+               "anand", "tarun", "sunny", "gokul", "vijay", "mohit", "soham"}
+# edge-tts publishes Gender per voice; read from list_voices(), not from the name.
+EDGE_FEMALE = {"en-US-AriaNeural", "en-US-JennyNeural", "en-GB-SoniaNeural",
+               "en-IN-NeerjaNeural", "en-IN-NeerjaExpressiveNeural", "hi-IN-SwaraNeural"}
+EDGE_MALE = {"en-US-GuyNeural", "en-GB-RyanNeural", "en-IN-PrabhatNeural",
+             "hi-IN-MadhurNeural"}
+
+FEMALE_VOICES = {f"sarvam:{s}" for s in SARVAM_FEMALE} | EDGE_FEMALE
+MALE_VOICES = {f"sarvam:{s}" for s in SARVAM_MALE} | EDGE_MALE
+
+FEMININE_CLAUSE = (
+    " You are speaking aloud through a FEMALE voice, so use FEMININE first-person Hindi "
+    "grammar: सुन रही हूँ, बताती हूँ, कर सकती हूँ, मैं आ गई। Never masculine forms like "
+    "सुन रहा हूँ / कर सकता हूँ — the voice is female and the mismatch is audible. "
+    "English needs no change."
+)
+MASCULINE_CLAUSE = (
+    " You are speaking aloud through a MALE voice, so use MASCULINE first-person Hindi "
+    "grammar: सुन रहा हूँ, बताता हूँ, कर सकता हूँ। Never feminine forms like सुन रही हूँ / "
+    "कर सकती हूँ. English needs no change."
+)
+
+
+def gender_of(voice: str | None) -> str:
+    """'f' | 'm' | '' — '' when the voice is unrecognised, so we add no clause at all."""
+    v = (voice or "").strip().lower()
+    if v in FEMALE_VOICES:
+        return "f"
+    if v in MALE_VOICES:
+        return "m"
+    return ""
+
 # System prompt / persona for the assistant.
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
@@ -137,6 +192,16 @@ SYSTEM_PROMPT = os.environ.get(
 )
 
 DEFAULT_USER = os.environ.get("DEFAULT_USER", "there")
+
+
+def persona_for(voice: str | None) -> str:
+    """The system prompt plus the grammatical-gender clause for the voice speaking it."""
+    g = gender_of(voice)
+    if g == "f":
+        return SYSTEM_PROMPT + FEMININE_CLAUSE
+    if g == "m":
+        return SYSTEM_PROMPT + MASCULINE_CLAUSE
+    return SYSTEM_PROMPT
 
 app = FastAPI(title="Hermes Web Voice Assistant")
 
@@ -412,7 +477,9 @@ async def brain(req: BrainRequest):
         "input": text,
         "model": BRAIN_MODEL,
         # instructions guide tone/concision without replacing the native persona.
-        "instructions": SYSTEM_PROMPT,
+        # The voice is resolved with the SAME function /tts uses, so the reply's Hindi
+        # grammar agrees with the voice that will read it (सुन रही हूँ for a female voice).
+        "instructions": persona_for(pick_tts_voice(text, req.voice)),
     }
     if session_id:
         payload["session_id"] = session_id
@@ -442,10 +509,12 @@ async def brain(req: BrainRequest):
             _collect_tool_events(host, port, run_id, tool_rows)
         )
 
-        # Poll GET /v1/runs/{run_id} until the run settles.
+        # Poll GET /v1/runs/{run_id} until the run settles. The budget is the backstop
+        # (BRAIN_RUN_TIMEOUT_S), NOT a 2-minute ceiling: long tool runs are normal.
         status_url = url + "/" + run_id
-        for _ in range(60):
-            await asyncio.sleep(2)
+        deadline = time.monotonic() + BRAIN_RUN_TIMEOUT_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(BRAIN_POLL_S)
             pr = await client.get(status_url, headers={"Authorization": f"Bearer {BRAIN_KEY}"})
             if pr.status_code == 404:
                 # transient: run not yet registered under a fresh host; retry
@@ -464,21 +533,50 @@ async def brain(req: BrainRequest):
                 except (asyncio.CancelledError, Exception):
                     pass
                 if status != "completed":
-                    publish({"type": "run.settled", "run_id": run_id, "status": status})
+                    publish({"type": "run.settled", "run_id": run_id, "status": status,
+                             "session_id": session_id,
+                             "error": (st.get("error") or "")[:300]})
                     raise HTTPException(502, f"Brain run {status}: {st.get('error','')}")
                 reply = (st.get("output") or "").strip()
                 if not reply:
                     raise HTTPException(502, "Brain returned empty reply")
                 log.info("BRAIN -> %r (%d tool calls)", reply, len(tool_rows))
+                # The panel may no longer be listening to THIS request (a long run can
+                # outlive the browser's or a proxy's patience). Carry the answer on the
+                # event stream too, so the turn finishes even when the wait dies.
                 publish({"type": "run.settled", "run_id": run_id, "status": "completed",
-                         "session_id": session_id})
+                         "session_id": session_id, "reply": reply, "tools": tool_rows})
                 return {"reply": reply, "run_id": run_id, "session_id": session_id,
                         "tools": tool_rows}
             if status == "queued" or status == "running":
                 continue
         events_task.cancel()
-        publish({"type": "run.settled", "run_id": run_id, "status": "timeout"})
-        raise HTTPException(504, "Brain run timed out")
+        publish({"type": "run.settled", "run_id": run_id, "status": "timeout",
+                 "session_id": session_id})
+        raise HTTPException(504, f"Brain run still working after {int(BRAIN_RUN_TIMEOUT_S)}s")
+
+
+@app.get("/brain/{run_id}")
+async def brain_status(run_id: str):
+    """Non-blocking view of a run the panel is still waiting on.
+
+    /brain holds its HTTP response until the run settles; when that wait dies first
+    (backend backstop, proxy, or browser idle limit) the panel polls this instead of
+    losing the turn. It proxies one cheap GET to the brain and returns immediately.
+    """
+    if not BRAIN_KEY:
+        raise HTTPException(500, "API_SERVER_KEY not configured")
+    host, port, _idx = await find_brain_host()
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(f"http://{host}:{port}/v1/runs/{run_id}",
+                             headers={"Authorization": f"Bearer {BRAIN_KEY}"})
+    if r.status_code != 200:
+        raise HTTPException(502, f"run lookup failed: {r.status_code}")
+    st = r.json()
+    status = st.get("status")
+    return {"run_id": run_id, "status": status,
+            "reply": (st.get("output") or "").strip() if status == "completed" else "",
+            "error": (st.get("error") or "")[:300]}
 
 
 # ---------- TTS ----------
@@ -650,6 +748,9 @@ async def health():
             # TTS attribution: which engine the defaults actually resolve to (a stale
             # Coolify env row silently overrides every code default — this is the check)
             "tts_engine": "sarvam" if sarvam_speaker_of(TTS_VOICE) else "edge-tts",
+            # which grammatical gender the assistant is told to speak in, and why:
+            # it follows the voice, so a female voice never says "सुन रहा हूँ"
+            "voice_gender": gender_of(TTS_VOICE) or "unset",
             "sarvam": {"key": bool(SARVAM_KEY), "model": SARVAM_MODEL,
                        "speaker": SARVAM_SPEAKER, "rate": SARVAM_RATE},
             # STT attribution: which upstream outcomes have happened this container, and the
