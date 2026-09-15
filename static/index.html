@@ -343,12 +343,28 @@ body.orb-on.seamless-active #conv { display: none; }
 }
 /* With the chat hidden, a reply could only be HEARD, never read. The orb keeps its own
    space for the words: the command you just gave, dimmed, above the reply being spoken. */
-.orb-reply { flex: 0 0 auto; max-height: 42%; overflow-y: auto; padding: 2px 22px 16px; text-align: center; }
+.orb-reply { flex: 0 0 auto; max-height: 42%; display: flex; flex-direction: column; overflow: hidden;
+  padding: 0 22px 16px; text-align: center; }
+/* The strip is collapsible: the orb is a face, and a long reply can eat the room it
+   needs. Tapping the bar hides the words and leaves the bar (with a dot for a reply
+   that arrived while it was closed). Collapsed is a stored preference, so it stays. */
+.orb-reply .or-bar { flex: 0 0 auto; display: flex; align-items: center; justify-content: center; gap: 7px;
+  height: 24px; cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent;
+  font-family: var(--mono); font-size: 9px; letter-spacing: 2.2px; text-transform: uppercase; color: var(--ink-faint); }
+.orb-reply .or-bar:hover, .orb-reply .or-bar:focus-visible { color: var(--accent); outline: none; }
+.orb-reply .or-bar .or-caret { font-size: 10px; line-height: 1; transition: transform .18s; }
+.orb-reply.collapsed .or-bar .or-caret { transform: rotate(-90deg); }
+.orb-reply .or-bar .or-new { width: 6px; height: 6px; border-radius: 50%; background: var(--accent2); display: none; }
+.orb-reply.collapsed.has-new .or-bar .or-new { display: block; }
+.orb-reply .or-body { flex: 1 1 auto; overflow-y: auto; padding-top: 2px; }
+.orb-reply:not(.has-content) .or-bar { display: none; }
+.orb-reply.collapsed { max-height: 34px; padding-bottom: 4px; }
+.orb-reply.collapsed .or-body { display: none; }
 .orb-reply .or-you { font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--ink-faint); margin-bottom: 7px; }
 .orb-reply .or-ai { font-size: 15px; line-height: 1.55; color: var(--ink); white-space: pre-wrap; }
 .orb-reply .or-ai .who { display: block; font-family: var(--mono); font-size: 9px; letter-spacing: 2px; color: var(--accent2); margin-bottom: 4px; }
-.orb-reply::-webkit-scrollbar { width: 8px; }
-.orb-reply::-webkit-scrollbar-thumb { background: rgba(150,180,230,.18); border-radius: 8px; }
+.orb-reply .or-body::-webkit-scrollbar { width: 8px; }
+.orb-reply .or-body::-webkit-scrollbar-thumb { background: rgba(150,180,230,.18); border-radius: 8px; }
 
 .typebar {
   display: flex; align-items: flex-end; gap: 8px;
@@ -408,7 +424,9 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
   .dock-mic { gap: 8px; min-height: 78px; }
   .waveform { width: 96px; }
   .orb-caption { font-size: 8.5px; letter-spacing: 2px; padding: 4px 0 2px; }
-  .orb-reply { padding: 2px 12px 12px; max-height: 46%; }
+  .orb-reply { padding: 0 12px 12px; max-height: 46%; }
+  .orb-reply .or-bar { height: 30px; font-size: 8.5px; letter-spacing: 2px; }
+  .orb-reply.collapsed { max-height: 38px; }
   .orb-reply .or-ai { font-size: 14px; }
   .orb-reply .or-you { font-size: 10px; }
   .pulse-ring { width: 56px; height: 56px; }
@@ -474,7 +492,12 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
       <div class="orb-stage" id="orbStage" aria-hidden="true">
         <canvas id="orbCanvas"></canvas>
         <div class="orb-caption" id="orbCaption">LISTENING</div>
-        <div class="orb-reply" id="orbReply"></div>
+        <div class="orb-reply" id="orbReply">
+          <div class="or-bar" id="orbReplyBar" role="button" tabindex="0" aria-expanded="true" title="Collapse / expand the reply">
+            <span class="or-caret">▾</span><span class="or-bar-t">HERMES reply</span><span class="or-new"></span>
+          </div>
+          <div class="or-body" id="orbReplyBody"></div>
+        </div>
       </div>
 
       <div class="conv" id="conv">
@@ -1201,20 +1224,48 @@ const orbStage = document.getElementById('orbStage');
 const orbCanvas = document.getElementById('orbCanvas');
 const orbCaption = document.getElementById('orbCaption');
 const orbReply = document.getElementById('orbReply');
+const orbReplyBar = document.getElementById('orbReplyBar');
+const orbReplyBody = document.getElementById('orbReplyBody');
 let orbLastCommand = '';
+
+// Collapsible strip: tap the bar to give the orb its room back. The choice is a
+// preference (localStorage), so it survives a reload, and a reply that lands while the
+// strip is closed raises a dot on the bar instead of reopening it unasked.
+let orbReplyCollapsed = localStorage.getItem('horbreply') === '0';
+function orbReplyApplyState() {
+  if (!orbReply) return;
+  orbReply.classList.toggle('collapsed', orbReplyCollapsed);
+  if (orbReplyBar) orbReplyBar.setAttribute('aria-expanded', orbReplyCollapsed ? 'false' : 'true');
+}
+function orbReplyToggle() {
+  orbReplyCollapsed = !orbReplyCollapsed;
+  localStorage.setItem('horbreply', orbReplyCollapsed ? '0' : '1');
+  if (!orbReplyCollapsed && orbReply) orbReply.classList.remove('has-new');
+  orbReplyApplyState();
+}
+if (orbReplyBar) {
+  orbReplyBar.addEventListener('click', orbReplyToggle);
+  orbReplyBar.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); orbReplyToggle(); }
+  });
+}
+orbReplyApplyState();
 
 // The orb hides the chat log, so the words need a home of their own: the command you
 // just gave (dimmed) and the reply being spoken (bright). Text only — the transcript
 // itself comes back the moment ORB is switched off.
 function setOrbReply(reply, command) {
   if (command !== undefined) orbLastCommand = command || '';
-  if (!orbReply) return;
+  if (!orbReply || !orbReplyBody) return;
   const cmd = orbLastCommand
     ? '<div class="or-you">YOU · ' + escapeHtml(orbLastCommand) + '</div>' : '';
   const ai = reply
     ? '<div class="or-ai"><span class="who">HERMES</span>' + escapeHtml(reply) + '</div>' : '';
-  orbReply.innerHTML = cmd + ai;
-  orbReply.scrollTop = 0;
+  orbReplyBody.innerHTML = cmd + ai;
+  orbReplyBody.scrollTop = 0;
+  orbReply.classList.toggle('has-content', !!(orbLastCommand || reply));
+  if (reply && orbReplyCollapsed) orbReply.classList.add('has-new');
+  orbReplyApplyState();
 }
 let orbOn = localStorage.getItem('horb') === '1';
 let orbLoop = null, orbT = 0, orbEnergy = 0, orbPrevE = 0, orbRipples = [];
