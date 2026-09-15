@@ -107,6 +107,16 @@ header {
 }
 .crew-toggle:hover { background: rgba(57,216,224,.16); }
 @media (min-width: 1024px) { .crew-toggle { display: none; } }
+/* Same look as CREW, but this one is NEVER hidden: NEW SESSION has to be reachable
+   even when the bottom dock is folded away, which is where the dock's copy lives. */
+.hud-btn {
+  font-family: var(--mono); font-size: 11px; letter-spacing: .5px;
+  padding: 5px 10px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+  background: rgba(57,216,224,.08); color: var(--accent);
+  border: 1px solid rgba(57,216,224,.35); transition: background .15s;
+}
+.hud-btn:hover { background: rgba(57,216,224,.16); }
+.hud-btn:active { transform: scale(.97); }
 
 /* ---------- main workspace ---------- */
 main {
@@ -386,6 +396,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
   .brand .sub { font-size: 9px; letter-spacing: 1.4px; }
   .chip { font-size: 10px; padding: 7px 9px; min-height: 34px; display: inline-flex; align-items: center; }
   .crew-toggle { padding: 7px 11px; min-height: 44px; display: inline-flex; align-items: center; }
+  .hud-btn { padding: 7px 11px; min-height: 44px; display: inline-flex; align-items: center; }
 
   main { padding: 0 10px 8px; gap: 8px; }
   .core-head { padding: 8px 12px; }
@@ -437,6 +448,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
   <div class="hud">
     <div class="chip" id="status">…</div>
     <div class="chip"><span class="dot"></span><b id="clock">--:--:--</b></div>
+    <button class="hud-btn" id="newSessTop" title="Stop this session's running runs and start a fresh session">⟲ NEW SESSION</button>
     <button class="crew-toggle" id="crewToggle">CREW</button>
   </div>
 </header>
@@ -1742,6 +1754,10 @@ async function newSession() {
   setMsg(ids.length ? 'NEW SESSION — RUNS STOPPED, FRESH CONTEXT.' : 'NEW SESSION — FRESH CONTEXT.', 'ok');
 }
 if (newSessBtn) newSessBtn.addEventListener('click', newSession);
+// the same action lives in the header too: the dock's control row folds away, and
+// "stop everything / start clean" must never be the thing you can't reach.
+const newSessTop = document.getElementById('newSessTop');
+if (newSessTop) newSessTop.addEventListener('click', newSession);
 
 /* ---------- collapsible dock ----------
    Folded, the dock keeps only the mic button (and the fold arrow), giving the
