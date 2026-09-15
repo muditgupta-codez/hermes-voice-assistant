@@ -109,6 +109,44 @@ TTS_VOICE_HI = os.environ.get("TTS_VOICE_HI") or TTS_VOICE
 EDGE_FALLBACK = "hi-IN-SwaraNeural"
 EDGE_FALLBACK_EN = "en-US-AriaNeural"
 
+# "Your voice starts from the middle — the first words are never heard." The mp3 the
+# panel receives is COMPLETE (it round-trips through STT word for word, and a real
+# Chromium plays it 0.000s -> end with no pause/abort), so nothing here is dropping
+# audio: the loss happens at the output device, which eats the first ~100-400 ms of a
+# freshly opened stream (the route switch getUserMedia triggers on a phone, or the
+# output device waking on a desktop). The victim is the first word, every time.
+# Cure is headroom, not a rebuild: every reply gets a short silent lead-in so the
+# device can swallow silence instead of "नमस्ते".
+TTS_PREROLL_MS = int(os.environ.get("TTS_PREROLL_MS", "350"))
+
+
+async def add_tts_preroll(audio: bytes, ms: int | None = None) -> bytes:
+    """Prepend a silent lead-in to an mp3. Never fatal: on any ffmpeg trouble the
+    audio is returned untouched, because a clipped onset beats a missing reply."""
+    ms = TTS_PREROLL_MS if ms is None else ms
+    if ms <= 0 or not audio:
+        return audio
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-t", f"{ms / 1000:.3f}", "-i",
+            f"anullsrc=r={SARVAM_RATE}:cl=mono",
+            "-i", "pipe:0",
+            "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
+            "-c:a", "libmp3lame", "-b:a", "64k", "-ar", str(SARVAM_RATE),
+            "-f", "mp3", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate(audio)
+    except Exception as e:
+        log.warning("tts preroll skipped: %s", e)
+        return audio
+    if proc.returncode != 0 or not out:
+        log.warning("tts preroll skipped (ffmpeg %s): %s", proc.returncode, err[:200])
+        return audio
+    return out
+
 # Whisper auto-detects the spoken language only when we DON'T pin one. Pinning
 # "en" is what mangled Hindi into English-sounding nonsense, so the default is now
 # auto-detect; STT_LANGUAGE (env) or a per-request `language` form field can pin it.
@@ -630,9 +668,12 @@ async def tts(req: BrainRequest):
         lang = "hi-IN" if _DEVANAGARI.search(text) else "en-IN"
         try:
             data = await sarvam_speak(text, speaker, lang)
+            # Silent lead-in: the output device eats the first fraction of a second, so
+            # let it eat silence instead of the first word (see add_tts_preroll).
+            data = await add_tts_preroll(data)
             return Response(content=data, media_type="audio/mpeg",
                             headers={"X-TTS-Voice": voice, "X-TTS-Engine": "sarvam",
-                                     "X-TTS-Lang": lang})
+                                     "X-TTS-Lang": lang, "X-TTS-Preroll": str(TTS_PREROLL_MS)})
         except Exception as e:
             log.warning("sarvam tts failed (%s) — falling back to edge-tts", e)
             speaker = None
@@ -644,8 +685,10 @@ async def tts(req: BrainRequest):
     except Exception as e:
         log.error("tts failed: %s", e)
         raise HTTPException(502, f"TTS failed: {e}")
+    data = await add_tts_preroll(data)
     return Response(content=data, media_type="audio/mpeg",
-                    headers={"X-TTS-Voice": voice, "X-TTS-Engine": engine})
+                    headers={"X-TTS-Voice": voice, "X-TTS-Engine": engine,
+                             "X-TTS-Preroll": str(TTS_PREROLL_MS)})
 
 
 # ---------- SESSION MANAGEMENT (proxy to the Hermes api_server) ----------
@@ -750,6 +793,7 @@ async def health():
             # TTS attribution: which engine the defaults actually resolve to (a stale
             # Coolify env row silently overrides every code default — this is the check)
             "tts_engine": "sarvam" if sarvam_speaker_of(TTS_VOICE) else "edge-tts",
+            "tts_preroll_ms": TTS_PREROLL_MS,
             # which grammatical gender the assistant is told to speak in, and why:
             # it follows the voice, so a female voice never says "सुन रहा हूँ"
             "voice_gender": gender_of(TTS_VOICE) or "unset",
