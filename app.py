@@ -10,7 +10,7 @@ getUserMedia + MediaRecorder (clean audio, echo cancellation built in), then:
 
     mic audio --POST /stt--> text --POST /brain--> reply --GET /tts--> mp3 -> play
 """
-import os, io, re, json, time, asyncio, uuid, logging, tempfile
+import os, io, re, json, time, base64, asyncio, uuid, logging, tempfile
 from pathlib import Path
 
 import httpx
@@ -82,8 +82,24 @@ async def find_brain_host() -> tuple[str, str, int]:
             return h, BRAIN_PORT, i
     return BRAIN_HOST, BRAIN_PORT, -1
 
-TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-AriaNeural")
-TTS_VOICE_HI = os.environ.get("TTS_VOICE_HI", "hi-IN-SwaraNeural")
+# Sarvam AI (bulbul:v3) is the natural Indian voice. edge-tts has exactly two Hindi
+# voices (Swara, Madhur) and narrates them flat; worse, Mudit's replies are Hinglish —
+# Devanagari and Latin words inside one sentence — and a single-edge-voice read of that
+# is exactly what sounds robotic. Sarvam reads code-mixed text properly.
+# Voice naming: "sarvam:<speaker>" routes to Sarvam, anything else stays on edge-tts.
+SARVAM_KEY = os.environ.get("SARVAM_API_KEY", "")
+SARVAM_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_MODEL = os.environ.get("SARVAM_TTS_MODEL", "bulbul:v3")
+SARVAM_SPEAKER = os.environ.get("SARVAM_SPEAKER", "ishita")
+# 22050 Hz — NOT 8000. Telephone-rate audio is itself a large part of "sounds synthetic".
+SARVAM_RATE = int(os.environ.get("SARVAM_SAMPLE_RATE", "22050"))
+
+TTS_VOICE = (os.environ.get("TTS_VOICE")
+             or (f"sarvam:{SARVAM_SPEAKER}" if SARVAM_KEY else "en-US-AriaNeural"))
+TTS_VOICE_HI = os.environ.get("TTS_VOICE_HI") or TTS_VOICE
+# Used only when a Sarvam call fails and we fall back to edge-tts mid-reply.
+EDGE_FALLBACK = "hi-IN-SwaraNeural"
+EDGE_FALLBACK_EN = "en-US-AriaNeural"
 
 # Whisper auto-detects the spoken language only when we DON'T pin one. Pinning
 # "en" is what mangled Hindi into English-sounding nonsense, so the default is now
@@ -97,6 +113,18 @@ def pick_tts_voice(text: str, asked: str | None = None) -> str:
     if asked and asked.strip().lower() not in ("", "auto", "default"):
         return asked.strip()
     return TTS_VOICE_HI if _DEVANAGARI.search(text or "") else TTS_VOICE
+
+
+def sarvam_speaker_of(voice: str) -> str | None:
+    """"sarvam:ishita" -> "ishita". None when this is an edge-tts voice name."""
+    if (voice or "").lower().startswith("sarvam:"):
+        return voice.split(":", 1)[1].strip() or SARVAM_SPEAKER
+    return None
+
+
+def is_real_edge_voice(voice: str) -> bool:
+    """edge-tts voices are '<lang>-<REGION>-<Name>Neural'; 'sarvam:x' is not one."""
+    return bool(voice) and not sarvam_speaker_of(voice) and voice.endswith("Neural")
 
 # System prompt / persona for the assistant.
 SYSTEM_PROMPT = os.environ.get(
@@ -454,6 +482,38 @@ async def brain(req: BrainRequest):
 
 
 # ---------- TTS ----------
+async def sarvam_speak(text: str, speaker: str, lang: str) -> bytes:
+    """Sarvam bulbul TTS -> mp3 bytes. Raises RuntimeError on anything but a clean 200."""
+    payload = {
+        "text": text,
+        "target_language_code": lang,
+        "speaker": speaker,
+        "model": SARVAM_MODEL,
+        "speech_sample_rate": SARVAM_RATE,
+        "output_audio_codec": "mp3",
+        "enable_preprocessing": True,   # normalises numbers/abbrevs/mixed script
+    }
+    async with httpx.AsyncClient(timeout=45) as c:
+        r = await c.post(SARVAM_URL, json=payload,
+                         headers={"api-subscription-key": SARVAM_KEY,
+                                  "Content-Type": "application/json"})
+    if r.status_code != 200:
+        raise RuntimeError(f"sarvam {r.status_code}: {r.text[:200]}")
+    audios = (r.json() or {}).get("audios") or []
+    if not audios:
+        raise RuntimeError("sarvam returned no audio")
+    return base64.b64decode(audios[0])
+
+
+async def edge_speak(text: str, voice: str) -> bytes:
+    path = TMP_DIR / f"tts_{uuid.uuid4().hex}.mp3"
+    try:
+        await edge_tts.Communicate(text, voice=voice).save(str(path))
+        return path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @app.post("/tts")
 async def tts(req: BrainRequest):
     """req.text holds the reply text; returns audio/mp3."""
@@ -461,21 +521,31 @@ async def tts(req: BrainRequest):
     if not text:
         raise HTTPException(400, "empty text")
     voice = pick_tts_voice(text, req.voice)
-    mp3_path = TMP_DIR / f"tts_{uuid.uuid4().hex}.mp3"
+    engine = "edge-tts"
 
-    async def _do():
-        c = edge_tts.Communicate(text, voice=voice)
-        await c.save(str(mp3_path))
+    # Sarvam handles the code-mixed Hindi/English a voice reply actually contains; a
+    # failure here must never cost the user their audio, so it degrades to edge-tts.
+    speaker = sarvam_speaker_of(voice) if SARVAM_KEY else None
+    if speaker:
+        lang = "hi-IN" if _DEVANAGARI.search(text) else "en-IN"
+        try:
+            data = await sarvam_speak(text, speaker, lang)
+            return Response(content=data, media_type="audio/mpeg",
+                            headers={"X-TTS-Voice": voice, "X-TTS-Engine": "sarvam",
+                                     "X-TTS-Lang": lang})
+        except Exception as e:
+            log.warning("sarvam tts failed (%s) — falling back to edge-tts", e)
+            speaker = None
 
+    if not is_real_edge_voice(voice):
+        voice = EDGE_FALLBACK if _DEVANAGARI.search(text) else EDGE_FALLBACK_EN
     try:
-        await _do()
+        data = await edge_speak(text, voice)
     except Exception as e:
         log.error("tts failed: %s", e)
         raise HTTPException(502, f"TTS failed: {e}")
-    data = mp3_path.read_bytes()
-    mp3_path.unlink(missing_ok=True)
     return Response(content=data, media_type="audio/mpeg",
-                    headers={"X-TTS-Voice": voice})
+                    headers={"X-TTS-Voice": voice, "X-TTS-Engine": engine})
 
 
 # ---------- SESSION MANAGEMENT (proxy to the Hermes api_server) ----------
@@ -577,6 +647,11 @@ async def health():
             # language plumbing, so the deployed panel can be checked without guessing
             "stt_language": STT_LANGUAGE or "auto", "tts_voice": TTS_VOICE,
             "tts_voice_hi": TTS_VOICE_HI,
+            # TTS attribution: which engine the defaults actually resolve to (a stale
+            # Coolify env row silently overrides every code default — this is the check)
+            "tts_engine": "sarvam" if sarvam_speaker_of(TTS_VOICE) else "edge-tts",
+            "sarvam": {"key": bool(SARVAM_KEY), "model": SARVAM_MODEL,
+                       "speaker": SARVAM_SPEAKER, "rate": SARVAM_RATE},
             # STT attribution: which upstream outcomes have happened this container, and the
             # last real (non-throttle, non-silence) failure with its Groq body.
             # STT attribution: outcome counts this container, the last real failure
