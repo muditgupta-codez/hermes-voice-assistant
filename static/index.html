@@ -320,16 +320,17 @@ body.seamless-active .dock-controls { margin-inline: auto; }
    visualiser fed by the same mic RMS the VAD gates on, so it moves with the user's
    actual voice (and with Hermes's turn while it speaks). Decorative: it reads state
    and never touches the recorder, the AudioContext or the playback element. */
-.orb-stage { display: none; position: relative; margin: 2px 0 2px; }
-body.orb-on.seamless-active .orb-stage { display: block; }
-.orb-stage canvas { display: block; width: 100%; max-width: 470px; margin: 0 auto; height: 152px; }
+.orb-stage { display: none; position: relative; }
+/* ORB ON takes over the CORE panel: the canvas goes where the chat log was, full
+   bleed, so the agent has a face while you talk. The dock keeps its controls. */
+body.orb-on.seamless-active .orb-stage { display: flex; flex: 1; min-height: 0; width: 100%; }
+body.orb-on.seamless-active #conv { display: none; }
+.orb-stage canvas { display: block; width: 100%; height: 100%; min-height: 0; }
 .orb-caption {
-  position: absolute; left: 0; right: 0; bottom: 7px; text-align: center; pointer-events: none;
+  position: absolute; left: 0; right: 0; bottom: 14px; text-align: center; pointer-events: none;
   font-family: var(--mono); font-size: 9px; letter-spacing: 2.6px; text-transform: uppercase;
   color: var(--accent); opacity: .78;
 }
-/* a folded dock stays minimal — the orb is one of the things that folds away */
-.dock.collapsed .orb-stage { display: none !important; }
 
 .typebar {
   display: flex; align-items: flex-end; gap: 8px;
@@ -387,8 +388,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
   .dock { padding: 10px 10px 8px; gap: 8px; }
   .dock-mic { gap: 8px; min-height: 78px; }
   .waveform { width: 96px; }
-  .orb-stage canvas { height: 108px; }
-  .orb-caption { font-size: 8.5px; letter-spacing: 2px; bottom: 2px; }
+  .orb-caption { font-size: 8.5px; letter-spacing: 2px; bottom: 10px; }
   .pulse-ring { width: 56px; height: 56px; }
   .mic-btn { inset: 5px; }
   .mic-btn svg { width: 22px; height: 22px; }
@@ -448,6 +448,11 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
         <div class="stream-body" id="streamBody"></div>
       </div>
 
+      <div class="orb-stage" id="orbStage" aria-hidden="true">
+        <canvas id="orbCanvas"></canvas>
+        <div class="orb-caption" id="orbCaption">LISTENING</div>
+      </div>
+
       <div class="conv" id="conv">
         <div class="empty-hint" id="emptyHint">
           <b>CORE LINKED</b>Talk freely — or type a command.<br><span class="cursor">▌</span>
@@ -498,10 +503,6 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
         </div>
       </div>
       <div class="listening-line" id="listen"></div>
-    </div>
-    <div class="orb-stage" id="orbStage" aria-hidden="true">
-      <canvas id="orbCanvas"></canvas>
-      <div class="orb-caption" id="orbCaption">LISTENING</div>
     </div>
     <div class="dock-controls">
       <button class="action" id="langBtn" title="Speech language for the mic — pinned, never guessed">LANG: EN</button>
