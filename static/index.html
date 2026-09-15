@@ -412,7 +412,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
     display: inline-flex; align-items: center; justify-content: center;
   }
   .voice-pick { max-width: none; flex: 1 1 40%; }
-  #autoSpeak, #sessionsBtn { flex: 1 1 auto; }
+  #autoSpeak, #sessionsBtn, #newSessBtn { flex: 1 1 auto; }
 
   /* typebar: hero input, ≥44px, 16px text (stops iOS auto-zoom) */
   .typebar { padding: 8px 10px; border-radius: 12px; }
@@ -523,6 +523,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
       <button class="action" id="seamlessBtn" title="Hands-free: talk without holding the mic, barge-in allowed">SEAMLESS: OFF</button>
       <button class="action" id="orbBtn" title="Seamless: reactive voice orb that moves with your voice">ORB: OFF</button>
       <button class="action mutebtn" id="muteBtn" title="Hands-free: hold to mute (agent stops listening)" hidden>HOLD TO MUTE</button>
+      <button class="action" id="newSessBtn" title="Stop this session's running tool calls and start a fresh session">⟲ NEW SESSION</button>
       <button class="action" id="sessionsBtn">🗂 SESSIONS</button>
     </div>
     <div class="typebar" id="typeBar" style="display:none">
@@ -1712,6 +1713,35 @@ function startNewSession() {
   conv.innerHTML = '';
   typeInput.focus();
 }
+
+/* ---------- NEW SESSION: stop what is running, then start clean ----------
+   Both halves matter. Aborting the panel's own fetch only stops WATCHING — the agent
+   keeps working upstream and its answer still lands in the old session — so the runs
+   are cancelled on the brain FIRST, then the panel drops its transcript, tool stream,
+   orb strip and turn registry and mints a fresh session id. The old session isn't
+   deleted: it stays in SESSIONS and can be resumed. */
+const newSessBtn = document.getElementById('newSessBtn');
+async function newSession() {
+  const ids = openTurns.map(t => t.runId).filter(Boolean);
+  for (const t of openTurns) if (t.poll) { clearInterval(t.poll); t.poll = null; }
+  interrupt();                        // silence the reply + abort the in-flight fetch
+  isBusy = false;
+  if (ids.length) {
+    setMsg('STOPPING THIS SESSION…');
+    // best effort: a run that already ended answers 409, which is not a failure
+    await Promise.all(ids.map(id => fetch(API + '/brain/' + encodeURIComponent(id) + '/stop',
+                                         {method:'POST'}).catch(()=>null)));
+  }
+  openTurns.length = 0;
+  turnIdle();
+  streamReset(); streamStateSet('idle', '');
+  setOrbReply('', '');
+  startNewSession();
+  sessionPanel.style.display = 'none';
+  sessionsBtn.textContent = '🗂 SESSIONS';
+  setMsg(ids.length ? 'NEW SESSION — RUNS STOPPED, FRESH CONTEXT.' : 'NEW SESSION — FRESH CONTEXT.', 'ok');
+}
+if (newSessBtn) newSessBtn.addEventListener('click', newSession);
 
 /* ---------- collapsible dock ----------
    Folded, the dock keeps only the mic button (and the fold arrow), giving the

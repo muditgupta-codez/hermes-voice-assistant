@@ -673,6 +673,35 @@ async def brain_status(run_id: str):
             "error": (st.get("error") or "")[:300]}
 
 
+@app.post("/brain/{run_id}/stop")
+async def brain_stop(run_id: str):
+    """Cancel a run on the brain — the NEW SESSION button's other half.
+
+    Aborting the panel's own fetch (barge-in) leaves the agent WORKING upstream: the
+    tool calls carry on and the answer still lands. Starting a fresh session is only
+    honest if the old one is actually stopped, so the panel asks the brain to interrupt
+    the run (which reaps the background processes that run started).
+    """
+    if not BRAIN_KEY:
+        raise HTTPException(500, "API_SERVER_KEY not configured")
+    host, port, _idx = await find_brain_host()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(f"http://{host}:{port}/v1/runs/{run_id}/stop",
+                                  headers={"Authorization": f"Bearer {BRAIN_KEY}"})
+    except Exception as e:
+        raise HTTPException(502, f"Brain unreachable: {e}")
+    if r.status_code >= 400:
+        # 409 = the run already left this gateway process (cancelled, finished or reaped):
+        # "nothing to stop", not something the user needs to see.
+        raise HTTPException(409 if r.status_code == 409 else 502,
+                            f"stop failed: {r.status_code} {r.text[:160]}")
+    try:
+        return r.json()
+    except Exception:
+        return {"run_id": run_id, "status": "stopping"}
+
+
 # ---------- TTS ----------
 async def sarvam_speak(text: str, speaker: str, lang: str) -> bytes:
     """Sarvam bulbul TTS -> mp3 bytes. Raises RuntimeError on anything but a clean 200."""
