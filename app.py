@@ -120,6 +120,51 @@ EDGE_FALLBACK_EN = "en-US-AriaNeural"
 TTS_PREROLL_MS = int(os.environ.get("TTS_PREROLL_MS", "350"))
 
 
+async def analyse_utterance(data: bytes) -> dict:
+    """What the panel actually SENT: duration, loudness, how much of it is silence.
+
+    A transcript that comes back as a fragment ("झाल" for a five-second sentence) is
+    un-diagnosable from a byte count alone — the audio could have been a 300 ms blip,
+    near-silent, or perfectly fine and mis-heard. One ffmpeg pass answers that, and the
+    numbers land in /health next to the transcript they produced."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-i", "pipe:0",
+            "-af", "silencedetect=noise=-40dB:d=0.3,volumedetect", "-f", "null", "-",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await asyncio.wait_for(proc.communicate(data), timeout=20)
+    except Exception as e:
+        return {"err": str(e)[:80]}
+    txt = err.decode("utf-8", "replace")
+    out: dict = {}
+    times = re.findall(r"time=(\d+):(\d+):(\d+\.?\d*)", txt)
+    if times:
+        h, mnt, s = times[-1]
+        out["dur_s"] = round(int(h) * 3600 + int(mnt) * 60 + float(s), 2)
+    for key, pat in (("max_db", r"max_volume:\s*(-?\d+\.?\d*)"),
+                     ("mean_db", r"mean_volume:\s*(-?\d+\.?\d*)")):
+        m = re.search(pat, txt)
+        if m:
+            out[key] = float(m.group(1))
+    sil = re.findall(r"silence_duration:\s*(\d+\.?\d*)", txt)
+    if sil:
+        out["silence_s"] = round(sum(float(x) for x in sil), 2)
+    if "silence_start: 0" in txt:
+        se = re.search(r"silence_end:\s*(\d+\.?\d*)", txt)
+        if se:
+            out["lead_silence_s"] = round(float(se.group(1)), 2)
+    return out
+
+
+async def diag_utterance(blob_id: int, data: bytes) -> None:
+    """Fill the audio metrics in the background — never on the STT critical path."""
+    m = await analyse_utterance(data)
+    if STT_DIAG.get("last_blob", {}).get("id") == blob_id:
+        STT_DIAG["last_blob"]["audio"] = m
+
+
 async def add_tts_preroll(audio: bytes, ms: int | None = None) -> bytes:
     """Prepend a silent lead-in to an mp3. Never fatal: on any ffmpeg trouble the
     audio is returned untouched, because a clipped onset beats a missing reply."""
@@ -310,9 +355,15 @@ async def stt(file: UploadFile = File(...), language: str | None = Form(None)):
         raise HTTPException(400, "empty audio")
 
     # What actually arrived, for every single utterance (not just failures).
-    STT_DIAG["last_blob"] = {"when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    STT_DIAG["blob_seq"] = STT_DIAG.get("blob_seq", 0) + 1
+    blob_id = STT_DIAG["blob_seq"]
+    STT_DIAG["last_blob"] = {"id": blob_id,
+                             "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                              "container": _sniff_container(data), "head": data[:12].hex(),
                              "bytes": len(data), "name": file.filename or ""}
+    # Duration / loudness / silence of that same upload, off the critical path: a
+    # fragment transcript is only explainable next to the audio it came from.
+    asyncio.create_task(diag_utterance(blob_id, data))
 
     # webm/ogg/mp4 from MediaRecorder — Groq accepts these. Language is auto-detected
     # unless STT_LANGUAGE / the `language` form field pins it (auto = Hindi works too).
@@ -370,6 +421,9 @@ async def stt(file: UploadFile = File(...), language: str | None = Form(None)):
     text = last.json().get("text", "").strip()
     log.info("STT -> %r", text)
     _stt_note("ok")
+    # pair the transcript with the audio metrics the ffmpeg pass is computing in parallel
+    if STT_DIAG.get("last_blob", {}).get("id") == blob_id:
+        STT_DIAG["last_blob"]["text"] = text[:300]
     return {"text": text}
 
 
