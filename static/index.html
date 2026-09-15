@@ -840,7 +840,17 @@ function drawWave(levels) {
 }
 
 // voices — AUTO lets the server match the reply's language (Hindi in, Hindi out)
-VOICES.forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=v; voicePick.appendChild(o); });
+const autoOpt = document.createElement('option');
+autoOpt.value = AUTO_VOICE; autoOpt.textContent = AUTO_VOICE;
+voicePick.appendChild(autoOpt);
+VOICE_GROUPS.forEach(([label, items])=>{
+  const og = document.createElement('optgroup'); og.label = label;
+  items.forEach(([value, text])=>{
+    const o = document.createElement('option'); o.value = value; o.textContent = text;
+    og.appendChild(o);
+  });
+  voicePick.appendChild(og);
+});
 voicePick.value = VOICES.includes(localStorage.getItem('hvoice')) ? localStorage.getItem('hvoice') : AUTO_VOICE;
 
 // speech language — ALWAYS pinned to one of the two, never auto-detected. Auto-detect

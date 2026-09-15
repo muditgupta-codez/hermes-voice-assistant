@@ -156,8 +156,10 @@ EDGE_FEMALE = {"en-US-AriaNeural", "en-US-JennyNeural", "en-GB-SoniaNeural",
 EDGE_MALE = {"en-US-GuyNeural", "en-GB-RyanNeural", "en-IN-PrabhatNeural",
              "hi-IN-MadhurNeural"}
 
-FEMALE_VOICES = {f"sarvam:{s}" for s in SARVAM_FEMALE} | EDGE_FEMALE
-MALE_VOICES = {f"sarvam:{s}" for s in SARVAM_MALE} | EDGE_MALE
+# Lookup is done on the lowercased voice name (gender_of lowercases first), so both sets
+# have to be lowercased too — edge names are mixed case ('en-US-AriaNeural').
+FEMALE_VOICES = {f"sarvam:{s}" for s in SARVAM_FEMALE} | {v.lower() for v in EDGE_FEMALE}
+MALE_VOICES = {f"sarvam:{s}" for s in SARVAM_MALE} | {v.lower() for v in EDGE_MALE}
 
 FEMININE_CLAUSE = (
     " You are speaking aloud through a FEMALE voice, so use FEMININE first-person Hindi "
