@@ -323,14 +323,22 @@ body.seamless-active .dock-controls { margin-inline: auto; }
 .orb-stage { display: none; position: relative; }
 /* ORB ON takes over the CORE panel: the canvas goes where the chat log was, full
    bleed, so the agent has a face while you talk. The dock keeps its controls. */
-body.orb-on.seamless-active .orb-stage { display: flex; flex: 1; min-height: 0; width: 100%; }
+body.orb-on.seamless-active .orb-stage { display: flex; flex-direction: column; flex: 1; min-height: 0; width: 100%; }
 body.orb-on.seamless-active #conv { display: none; }
-.orb-stage canvas { display: block; width: 100%; height: 100%; min-height: 0; }
+.orb-stage canvas { display: block; width: 100%; flex: 1 1 auto; min-height: 110px; }
 .orb-caption {
-  position: absolute; left: 0; right: 0; bottom: 14px; text-align: center; pointer-events: none;
+  flex: 0 0 auto; padding: 6px 0 4px; text-align: center; pointer-events: none;
   font-family: var(--mono); font-size: 9px; letter-spacing: 2.6px; text-transform: uppercase;
   color: var(--accent); opacity: .78;
 }
+/* With the chat hidden, a reply could only be HEARD, never read. The orb keeps its own
+   space for the words: the command you just gave, dimmed, above the reply being spoken. */
+.orb-reply { flex: 0 0 auto; max-height: 42%; overflow-y: auto; padding: 2px 22px 16px; text-align: center; }
+.orb-reply .or-you { font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--ink-faint); margin-bottom: 7px; }
+.orb-reply .or-ai { font-size: 15px; line-height: 1.55; color: var(--ink); white-space: pre-wrap; }
+.orb-reply .or-ai .who { display: block; font-family: var(--mono); font-size: 9px; letter-spacing: 2px; color: var(--accent2); margin-bottom: 4px; }
+.orb-reply::-webkit-scrollbar { width: 8px; }
+.orb-reply::-webkit-scrollbar-thumb { background: rgba(150,180,230,.18); border-radius: 8px; }
 
 .typebar {
   display: flex; align-items: flex-end; gap: 8px;
@@ -388,7 +396,10 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
   .dock { padding: 10px 10px 8px; gap: 8px; }
   .dock-mic { gap: 8px; min-height: 78px; }
   .waveform { width: 96px; }
-  .orb-caption { font-size: 8.5px; letter-spacing: 2px; bottom: 10px; }
+  .orb-caption { font-size: 8.5px; letter-spacing: 2px; padding: 4px 0 2px; }
+  .orb-reply { padding: 2px 12px 12px; max-height: 46%; }
+  .orb-reply .or-ai { font-size: 14px; }
+  .orb-reply .or-you { font-size: 10px; }
   .pulse-ring { width: 56px; height: 56px; }
   .mic-btn { inset: 5px; }
   .mic-btn svg { width: 22px; height: 22px; }
@@ -451,6 +462,7 @@ footer { flex-shrink: 0; font-family: var(--mono); font-size: 9.5px; color: var(
       <div class="orb-stage" id="orbStage" aria-hidden="true">
         <canvas id="orbCanvas"></canvas>
         <div class="orb-caption" id="orbCaption">LISTENING</div>
+        <div class="orb-reply" id="orbReply"></div>
       </div>
 
       <div class="conv" id="conv">
@@ -1175,6 +1187,22 @@ const orbBtn = document.getElementById('orbBtn');
 const orbStage = document.getElementById('orbStage');
 const orbCanvas = document.getElementById('orbCanvas');
 const orbCaption = document.getElementById('orbCaption');
+const orbReply = document.getElementById('orbReply');
+let orbLastCommand = '';
+
+// The orb hides the chat log, so the words need a home of their own: the command you
+// just gave (dimmed) and the reply being spoken (bright). Text only — the transcript
+// itself comes back the moment ORB is switched off.
+function setOrbReply(reply, command) {
+  if (command !== undefined) orbLastCommand = command || '';
+  if (!orbReply) return;
+  const cmd = orbLastCommand
+    ? '<div class="or-you">YOU · ' + escapeHtml(orbLastCommand) + '</div>' : '';
+  const ai = reply
+    ? '<div class="or-ai"><span class="who">HERMES</span>' + escapeHtml(reply) + '</div>' : '';
+  orbReply.innerHTML = cmd + ai;
+  orbReply.scrollTop = 0;
+}
 let orbOn = localStorage.getItem('horb') === '1';
 let orbLoop = null, orbT = 0, orbEnergy = 0, orbPrevE = 0, orbRipples = [];
 let orbW = 0, orbH = 0, orbNeedResize = true;
@@ -1386,6 +1414,7 @@ async function processAudio(blob) {
     const text = sj.text.trim();
     if (!text) { setMsg('DIDN’T CATCH THAT — TRY AGAIN.'); isBusy=false; setStatus('MIC READY','on'); setMode('VOICE READY'); return; }
     addBubble(text, 'user');
+    setOrbReply('', text);
     await doBrain(text);
   } catch(e) {
     setMsg('ERROR: ' + e.message, 'err');
@@ -1422,6 +1451,7 @@ async function finishTurn(turn, reply) {
   turnDrop(turn);
   if (reply) {
     addBubble(reply, 'ai');
+    setOrbReply(reply);          // the orb shows the reply it is speaking
     if (autoSpeak && wasNewest) await speak(reply);
   } else if (!openTurns.length) {
     setMsg('THE RUN ENDED WITHOUT AN ANSWER.', 'err');
@@ -1550,6 +1580,7 @@ async function sendTyped() {
   if (!t) return;
   typeInput.value=''; autoGrow(); sendBtn.disabled = true;
   addBubble(t,'user');
+  setOrbReply('', t);
   await doBrain(t);
   sendBtn.disabled = false;
   typeInput.focus();
@@ -1562,6 +1593,7 @@ document.querySelectorAll('.quick-chip').forEach(ch=>{
     const cmd = ch.dataset.cmd;
     clearEmptyHint();
     addBubble(cmd,'user');
+    setOrbReply('', cmd);
     doBrain(cmd);
   });
 });
